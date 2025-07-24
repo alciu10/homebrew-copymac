@@ -1,18 +1,22 @@
-// swift-tools-version:5.9
+// swift-tools-version:5.7
 import PackageDescription
 
 let package = Package(
-    name: "MySwiftProject",
+    name: "GraMac",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v12)
     ],
     products: [
-        .executable(name: "MySwiftProject", targets: ["MySwiftProject"])
+        .executable(
+            name: "GraMac",
+            targets: ["GraMac"])
     ],
     targets: [
         .executableTarget(
-            name: "MySwiftProject",
-            path: "Sources"
+            name: "GraMac",
+            dependencies: [],
+            path: "Sources",
+            sources: ["main.swift"]
         )
     ]
 )
