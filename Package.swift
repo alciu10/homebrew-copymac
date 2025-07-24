@@ -1,22 +1,18 @@
-// swift-tools-version:5.7
+// swift-tools-version: 5.9
 import PackageDescription
 
 let package = Package(
-    name: "GraMac",
+    name: "copymac-clipboard",
     platforms: [
         .macOS(.v12)
     ],
     products: [
-        .executable(
-            name: "GraMac",
-            targets: ["GraMac"])
+        .executable(name: "copymac-clipboard", targets: ["CopyMacClipboard"])
     ],
     targets: [
         .executableTarget(
-            name: "GraMac",
-            dependencies: [],
-            path: "Sources",
-            sources: ["main.swift"]
+            name: "CopyMacClipboard",
+            path: "Sources"
         )
     ]
 )
