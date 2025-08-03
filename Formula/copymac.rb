@@ -1,15 +1,16 @@
 class Copymac < Formula
-  desc "macOS clipboard CLI manager"
-  homepage "https://github.com/alciu10/homebrew-copymac"
-  url "https://github.com/alciu10/homebrew-copymac/releases/download/v1.0.0/copymac.tar.gz"
-  sha256 "76433ad2a4538590017cb30375ff06cf91b6481fe6fcf7e7aae4b8fbc62b4a7b"
-  version "1.0.0"
+  desc "macOS clipboard GUI manager with smooth animations and favorites"
+  homepage "https://github.com/alciu10/CopyMac-Repo"
+  url "https://github.com/alciu10/CopyMac-Repo/archive/af200f52cf5a86778f73781695375e4e2abefd3e.tar.gz"
+  sha256 "14bba0fdb2c9b5b292218c46bbdd3feb2215391df97b4e80db042af76ae0c8fd"
+  version "1.1.0"
 
   def install
-    bin.install "copymac-clipboard"
+    system "swift", "build", "--configuration", "release"
+    bin.install ".build/release/copymac-clipboard"
   end
 
   test do
-    system "#{bin}/copymac-clipboard", "--help"
+    system "#{bin}/copymac-clipboard", "--version"
   end
 end
