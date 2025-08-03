@@ -1,11 +1,11 @@
 cask "copymac" do
-  version "1.0.0"
-  sha256 "ac157304f058fc0dce998e9c12983a29da3e3cec7b7c98275004411811da7ff4"
+  version "1.3.0"
+  sha256 "322b95efa0922720547a81a27ea7d05107d0d381cd22ec6e3c2103ce7aed58f4"
 
-  url "https://github.com/alciu10/homebrew-copymac/releases/download/v#{version}/CopyMac.app.zip"
+  url "https://github.com/alciu10/CopyMac-Repo/releases/download/v#{version}/CopyMac.app.zip"
   name "CopyMac"
-  desc "Clipboard manager for macOS"
-  homepage "https://github.com/alciu10/homebrew-copymac"
+  desc "macOS clipboard manager"
+  homepage "https://github.com/alciu10/CopyMac-Repo"
 
   app "CopyMac.app"
 end
