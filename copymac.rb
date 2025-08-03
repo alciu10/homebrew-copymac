@@ -1,15 +1,16 @@
 class Copymac < Formula
-  desc "Clipboard manager app for macOS"
+  desc "macOS clipboard manager"
   homepage "https://github.com/alciu10/homebrew-copymac"
-  url "https://github.com/alciu10/homebrew-copymac/releases/download/v1.2.1/CopyMac.app.zip"
-  sha256 "119e1df12efa6afbb1f7bb0daf621d9720f46eaae4f27e4cbdbdbe0865985fbb"
-  version "1.2.1"
+  url "https://github.com/alciu10/homebrew-copymac/releases/download/v1.3.0/copymac.tar.gz"
+  sha256 "d6ac7b7e17d9a20c3bfb2ad3393f5559846f4f93c7c3da083a7a887db9310cc4"
+  version "1.3.0"
 
   def install
-    bin.install "copymac"
+    prefix.install Dir["*"]
+    bin.install "CopyMac.app/Contents/MacOS/CopymacClipboard"
   end
 
   test do
-    system "#{bin}/copymac", "--help"
+    system "#{bin}/CopymacClipboard", "--help"
   end
 end
