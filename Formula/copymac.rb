@@ -2,7 +2,7 @@ class Copymac < Formula
   desc "macOS clipboard CLI manager"
   homepage "https://github.com/alciu10/homebrew-copymac"
   url "https://github.com/alciu10/CopyMac-Repo/releases/download/v1.3.0/copymac.tar.gz"
-  sha256 "4f5a7d64465182621bfa7435ff32475c665649aac416898bdeab3037943e947f"
+  sha256 "48055275b03793f6682a0348ea34998dd381c0a39d59a4b297457e753c8a80fd"
   version "1.3.0"
 
   def install
