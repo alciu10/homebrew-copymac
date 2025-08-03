@@ -787,6 +787,13 @@ class ClipboardViewModel: ObservableObject {
     func addShortcut(key: String, modifier: String) {
         print("Adding shortcut - key: '\(key)', modifier: '\(modifier)'")
         
+        // Require at least one modifier for Carbon RegisterEventHotKey
+        if modifier == "None" {
+            print("No modifier selected - Carbon requires at least one modifier")
+            toast("Please select a modifier key (⌘, ⌥, ⌃, or ⇧)")
+            return
+        }
+        
         let modifierMap: [String: String] = [
             "Command (⌘)": "⌘",
             "Option (⌥)": "⌥",
@@ -801,19 +808,12 @@ class ClipboardViewModel: ObservableObject {
             "Right Arrow (→)": "→"
         ]
         
-        let fullCombo = modifier == "None" ? key : (modifierMap[modifier] ?? "") + key
+        let fullCombo = (modifierMap[modifier] ?? "") + key
         print("Full combo created: '\(fullCombo)'")
         
         if keyboardShortcuts.contains(where: { $0.combo == fullCombo }) {
             print("Shortcut already exists: \(fullCombo)")
             toast("Shortcut already exists")
-            return
-        }
-        
-        if !AXIsProcessTrusted() {
-            print("Accessibility permission not granted")
-            toast("Accessibility permission required")
-            _ = GlobalHotkeyManager.shared.checkAccessibilityPermission()
             return
         }
         
@@ -824,7 +824,7 @@ class ClipboardViewModel: ObservableObject {
             toast("Shortcut added: \(fullCombo)")
         } else {
             print("Failed to register shortcut: \(fullCombo)")
-            toast("Failed to register shortcut")
+            toast("Failed to register shortcut - try a different combination")
         }
     }
     
@@ -991,12 +991,11 @@ struct ClipboardAppView: View {
     @StateObject private var hotkeyManager = GlobalHotkeyManager.shared
     @StateObject private var menuBarManager = MenuBarManager()
     @State private var newShortcut: String = ""
-    @State private var selectedHotkey: String = "None"
+    @State private var selectedHotkey: String = "Command (⌘)"
     @State private var manualText: String = ""
     @State private var addToFavorites: Bool = false
     
     private let availableHotkeys = [
-        "None",
         "Command (⌘)",
         "Option (⌥)",
         "Control (⌃)",
@@ -1412,7 +1411,7 @@ struct ClipboardAppView: View {
                 if !newShortcut.isEmpty {
                     vm.addShortcut(key: newShortcut, modifier: selectedHotkey)
                     newShortcut = ""
-                    selectedHotkey = "None"
+                    selectedHotkey = "Command (⌘)"
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -1423,28 +1422,8 @@ struct ClipboardAppView: View {
     
     var accessibilityWarning: some View {
         Group {
-            if !AXIsProcessTrusted() {
-                HStack {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
-                        .font(.caption)
-                    
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Accessibility permission required")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                        
-                        Button("Open System Settings") {
-                            hotkeyManager.openAccessibilitySettings()
-                        }
-                        .font(.caption)
-                        .buttonStyle(.bordered)
-                    }
-                }
-                .padding(8)
-                .background(Color.orange.opacity(0.1))
-                .cornerRadius(8)
-            }
+            // Remove accessibility warning since we don't need it for modifier-based hotkeys
+            EmptyView()
         }
     }
     
