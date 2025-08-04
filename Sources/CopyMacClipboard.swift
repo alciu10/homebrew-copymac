@@ -64,7 +64,13 @@ class MenuBarManager: ObservableObject {
     private var statusItem: NSStatusItem?
     
     func createMenuBarIcon() {
-        return
+        // TODO: Implement menu bar icon creation
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem?.button {
+            button.image = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "CopyMac")
+            button.action = #selector(menuBarClicked)
+            button.target = self
+        }
     }
     
     func removeMenuBarIcon() {
@@ -88,9 +94,52 @@ class GlobalHotkeyManager: ObservableObject {
     private var isAppVisible = false
     @Published var isRegistered = false
     private var eventHandler: EventHandlerRef?
+    private var permissionCheckTimer: Timer?
 
     private init() {
         setupEventHandler()
+        // CHANGED: Start monitoring Accessibility permissions
+        startPermissionMonitoring()
+        // CHANGED: Register for distributed notifications to detect permission changes
+        DistributedNotificationCenter.default.addObserver(
+            self,
+            selector: #selector(accessibilityPermissionsChanged),
+            name: NSNotification.Name("com.apple.accessibility.api"),
+            object: nil
+        )
+    }
+    
+    // CHANGED: Monitor Accessibility permission changes
+    @objc private func accessibilityPermissionsChanged() {
+        print("Accessibility permissions changed, re-checking and re-registering hotkeys")
+        checkAndRegisterHotkeys()
+    }
+    
+    // CHANGED: Start a timer to periodically check permissions
+    private func startPermissionMonitoring() {
+        permissionCheckTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if AXIsProcessTrusted() && !self.isRegistered {
+                print("Accessibility granted, attempting to register hotkeys")
+                self.checkAndRegisterHotkeys()
+            }
+        }
+    }
+    
+    // CHANGED: Centralized hotkey registration with permission check
+    private func checkAndRegisterHotkeys() {
+        guard checkAccessibilityPermission() else {
+            print("Accessibility permission not granted, cannot register hotkeys")
+            isRegistered = false
+            return
+        }
+        
+        // Re-register all hotkeys
+        for (combo, _) in hotkeyRefs {
+            unregisterHotkey(combo)
+            _ = registerHotkey(combo)
+        }
+        isRegistered = !hotkeyRefs.isEmpty
     }
 
     private func setupEventHandler() {
@@ -104,6 +153,7 @@ class GlobalHotkeyManager: ObservableObject {
                 guard let nextHandler = nextHandler,
                       let event = event,
                       let userData = userData else {
+                    print("Invalid event handler parameters")
                     return noErr
                 }
                 return GlobalHotkeyManager.staticEventHandler(nextHandler: nextHandler, event: event, userData: userData)
@@ -115,6 +165,8 @@ class GlobalHotkeyManager: ObservableObject {
         )
         if result != noErr {
             print("Failed to install event handler: \(result)")
+        } else {
+            print("Event handler installed successfully")
         }
     }
 
@@ -132,19 +184,24 @@ class GlobalHotkeyManager: ObservableObject {
             &hotKeyID
         )
         if status == noErr {
+            print("Hotkey event received: ID \(hotKeyID.id)")
             for (combo, _) in manager.hotkeyRefs {
                 let refID = EventHotKeyID(signature: "CMAC".fourCharCode, id: UInt32(combo.hashValue & 0xFFFF))
                 if hotKeyID.id == refID.id {
+                    print("Matched hotkey combo: \(combo)")
                     manager.toggleAppVisibility()
                     break
                 }
             }
+        } else {
+            print("Failed to get event parameter: \(status)")
         }
         return noErr
     }
 
     func toggleAppVisibility() {
         DispatchQueue.main.async {
+            print("Toggling app visibility, current state: \(self.isAppVisible)")
             if self.isAppVisible {
                 self.hideApp()
             } else {
@@ -154,6 +211,7 @@ class GlobalHotkeyManager: ObservableObject {
     }
 
     func showApp() {
+        print("Showing app")
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         
@@ -165,6 +223,7 @@ class GlobalHotkeyManager: ObservableObject {
     }
     
     func showAppAtMouse() {
+        print("Showing app at mouse location")
         NSApp.setActivationPolicy(.regular)
         
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
@@ -180,6 +239,7 @@ class GlobalHotkeyManager: ObservableObject {
     }
     
     func hideApp() {
+        print("Hiding app")
         withAnimation(.spring(response: 0.2, dampingFraction: 0.95)) {
             for window in NSApp.windows {
                 window.orderOut(nil)
@@ -190,7 +250,6 @@ class GlobalHotkeyManager: ObservableObject {
             NSApp.setActivationPolicy(.accessory)
             self.isAppVisible = false
             
-            // Clear any selected/highlighted items when hiding the app
             NotificationCenter.default.post(name: NSNotification.Name("AppWillHide"), object: nil)
         }
     }
@@ -231,7 +290,7 @@ class GlobalHotkeyManager: ObservableObject {
         
         if status == noErr, let ref = hotkeyRef {
             hotkeyRefs[keyCombo] = ref
-            print("Hotkey registered successfully: \(keyCombo)")
+            print("Hotkey registered successfully: \(keyCombo), keyCode: \(keyCode), modifiers: \(String(format: "0x%X", modifiers))")
             isRegistered = !hotkeyRefs.isEmpty
             return true
         }
@@ -242,52 +301,62 @@ class GlobalHotkeyManager: ObservableObject {
     
     func unregisterHotkey(_ keyCombo: String) {
         if let ref = hotkeyRefs[keyCombo] {
-            UnregisterEventHotKey(ref)
+            let status = UnregisterEventHotKey(ref)
+            if status == noErr {
+                print("Hotkey unregistered successfully: \(keyCombo)")
+            } else {
+                print("Failed to unregister hotkey \(keyCombo): \(status)")
+            }
             hotkeyRefs.removeValue(forKey: keyCombo)
         }
         isRegistered = !hotkeyRefs.isEmpty
     }
     
     func unregisterAllHotkeys() {
-        for (_, ref) in hotkeyRefs {
-            UnregisterEventHotKey(ref)
+        for (combo, ref) in hotkeyRefs {
+            let status = UnregisterEventHotKey(ref)
+            print("Unregistering hotkey \(combo): \(status == noErr ? "Success" : "Failed with status \(status)")")
         }
         hotkeyRefs.removeAll()
         isRegistered = false
     }
     
-    func parseKeyCombo(_ combo: String) -> (keyCode: CGKeyCode, modifiers: UInt32)? {
+    func parseKeyCombo(_ keyCombo: String) -> (keyCode: CGKeyCode, modifiers: UInt32)? {
         var modifiers: UInt32 = 0
-        let keyChar = combo
+        var cleanedCombo = keyCombo
         
         let modifierSymbols = ["⌘", "⇧", "⌃", "⌥", "⇪", "⇥", " ", "↑", "↓", "←", "→"]
         let replacements = ["", "", "", "", "", "TAB", "SPACE", "UP", "DOWN", "LEFT", "RIGHT"]
         
-        var cleanedCombo = keyChar
         for (symbol, replacement) in zip(modifierSymbols, replacements) {
             cleanedCombo = cleanedCombo.replacingOccurrences(of: symbol, with: replacement)
         }
         cleanedCombo = cleanedCombo.trimmingCharacters(in: .whitespacesAndNewlines)
         
-        let baseKey = cleanedCombo.isEmpty ? keyChar : String(cleanedCombo.suffix(1))
+        // CHANGED: Ensure there's a valid key after modifiers
+        guard !cleanedCombo.isEmpty else {
+            print("Invalid key combo: No key specified after modifiers in \(keyCombo)")
+            return nil
+        }
         
-        if keyChar.range(of: "⌘") != nil { modifiers |= UInt32(cmdKey) }
-        if keyChar.range(of: "⇧") != nil { modifiers |= UInt32(shiftKey) }
-        if keyChar.range(of: "⌃") != nil { modifiers |= UInt32(controlKey) }
-        if keyChar.range(of: "⌥") != nil { modifiers |= UInt32(optionKey) }
-        if keyChar.range(of: "⇪") != nil { modifiers |= 0x10000 }
-        if keyChar.range(of: "🌐") != nil || keyChar.range(of: "fn") != nil {
+        let baseKey = String(cleanedCombo.suffix(1)).uppercased()
+        
+        if keyCombo.contains("⌘") { modifiers |= UInt32(cmdKey) }
+        if keyCombo.contains("⇧") { modifiers |= UInt32(shiftKey) }
+        if keyCombo.contains("⌃") { modifiers |= UInt32(controlKey) }
+        if keyCombo.contains("⌥") { modifiers |= UInt32(optionKey) }
+        if keyCombo.contains("⇪") { modifiers |= 0x10000 }
+        if keyCombo.contains("🌐") || keyCombo.contains("fn") {
             print("Fn key is not supported for hotkey registration")
             return nil
         }
         
-        let cleanKey = baseKey.uppercased()
-        guard let keyCode = charToKeyCode(cleanKey) else {
-            print("Invalid key code for: \(cleanKey)")
+        guard let keyCode = charToKeyCode(baseKey) else {
+            print("Invalid key code for: \(baseKey)")
             return nil
         }
         
-        print("Parsed combo \(combo): keyCode = \(keyCode), modifiers = \(String(format: "0x%X", modifiers))")
+        print("Parsed combo \(keyCombo): keyCode = \(keyCode), modifiers = \(String(format: "0x%X", modifiers))")
         return (keyCode, modifiers)
     }
     
@@ -314,6 +383,7 @@ class GlobalHotkeyManager: ObservableObject {
             kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
         ]
         let trusted = AXIsProcessTrustedWithOptions(options as CFDictionary)
+        print("Accessibility permission check: \(trusted ? "Granted" : "Denied")")
         if !trusted {
             let alert = NSAlert()
             alert.messageText = "Accessibility Permission Required"
@@ -333,13 +403,16 @@ class GlobalHotkeyManager: ObservableObject {
     func openAccessibilitySettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
+            print("Opened System Settings for Accessibility")
         }
     }
 
     deinit {
+        permissionCheckTimer?.invalidate()
         if let handler = eventHandler {
             RemoveEventHandler(handler)
         }
+        DistributedNotificationCenter.default.removeObserver(self)
     }
 }
 
@@ -492,7 +565,6 @@ class ClipboardViewModel: ObservableObject {
     
     private var changeCount = NSPasteboard.general.changeCount
     private let historyKey = "ClipboardHistory"
-    // Removed maxHistorySize limit for unlimited clipboard history
     private var searchWorkItem: DispatchWorkItem?
     
     var currentDimensions: (width: CGFloat, height: CGFloat) {
@@ -507,7 +579,6 @@ class ClipboardViewModel: ObservableObject {
         }
         updateGlobalHotkeys()
         
-        // Listen for app hide notification to clear selection states
         NotificationCenter.default.addObserver(
             forName: NSNotification.Name("AppWillHide"),
             object: nil,
@@ -595,8 +666,6 @@ class ClipboardViewModel: ObservableObject {
         } else if imageData != nil {
             insert(imageData: imageData, showToast: false)
         }
-        
-        // Removed size limit - unlimited clipboard history now
     }
     
     func insert(content: String = "", imageData: Data? = nil, isFavorite: Bool = false, showToast: Bool = true) {
@@ -960,6 +1029,7 @@ struct ClipboardAppView: View {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 
+                // CHANGED: Ensure hotkeys are registered on app launch
                 if hotkeyManager.checkAccessibilityPermission() && !vm.keyboardShortcuts.isEmpty {
                     vm.updateGlobalHotkeys()
                 }
