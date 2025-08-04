@@ -2,7 +2,7 @@ class Copymac < Formula
   desc "Clipboard manager for macOS"
   homepage "https://github.com/alciu10/homebrew-copymac"
   url "https://github.com/alciu10/homebrew-copymac/releases/download/v1.3.3/copymac-1.3.3.zip"
-  sha256 "fcfe6ae860d4921f65c16732c1e803de759565dbf09f01bbb41895e7c18a337d"
+  sha256 "4bded454fd9be4fc7c4f41fdd5e817de0b315576e586420c72b204276f382d22"
   version "1.3.3"
   license "MIT"
 
