@@ -1,16 +1,28 @@
 class Copymac < Formula
   desc "Clipboard manager for macOS"
   homepage "https://github.com/alciu10/homebrew-copymac"
-  url "https://github.com/alciu10/homebrew-copymac/releases/download/v1.3.8/copymac-1.3.8.zip"
-  sha256 "9016ba0fc9a8b80de89352610d1f72617b78bbb2eaac62a85689ff765a1f7e18"
-  version "1.3.8"
+  url "https://github.com/alciu10/homebrew-copymac/releases/download/v1.3.9/copymac-1.3.9.zip"
+  sha256 "49b05dd871262c824cc4b75998e7707520e30e04c62cc042187cfe6cd1508f15"
+  version "1.3.9"
   license "MIT"
 
   def install
-    bin.install "copymac"
+    prefix.install "CopyMac.app"
+  end
+
+  def caveats
+    <<~EOS
+      CopyMac has been installed as a GUI application.
+      
+      You can find it in your Applications folder or launch it with:
+        open "#{prefix}/CopyMac.app"
+      
+      To create a symlink in Applications folder:
+        ln -sf "#{prefix}/CopyMac.app" /Applications/
+    EOS
   end
 
   test do
-    system "#{bin}/copymac", "--help"
+    assert_predicate prefix/"CopyMac.app", :exist?
   end
 end
