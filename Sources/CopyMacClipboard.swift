@@ -1210,7 +1210,7 @@ struct ClipboardAppView: View {
                 importExportSection
                 Divider()
                 clearHistorySection
-                Text("Version v1.3.7")
+                Text("Version v1.3.8")
                     .font(.caption)
                     .foregroundColor(.gray)
                     .frame(maxWidth: .infinity, alignment: .center)
