@@ -7,7 +7,7 @@ class Copymac < Formula
   license "MIT"
 
   def install
-    prefix.install "CopyMac.app"
+    prefix.install Dir["*"]
   end
 
   def caveats
