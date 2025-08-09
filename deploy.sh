@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # CopyMac Fast Deploy Script
-# Usage: ./deploy.sh 1.5.2
+# Usage: ./deploy.sh 1.5.3
 
 set -e  # Exit on any error
 

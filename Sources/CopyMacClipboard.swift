@@ -1577,7 +1577,7 @@ struct ClipboardAppView: View {
                         }
                     }
                     
-                    Text("Version v1.5.2")
+                    Text("Version v1.5.3")
                         .font(.caption)
                         .foregroundColor(.gray)
                         .frame(maxWidth: .infinity, alignment: .center)
