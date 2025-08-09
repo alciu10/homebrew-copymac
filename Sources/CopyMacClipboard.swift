@@ -315,35 +315,23 @@ class GlobalHotkeyManager: ObservableObject {
     }
     
     func checkAccessibilityPermission() -> Bool {
-        // First check without prompting
-        let trusted = AXIsProcessTrusted()
-        
+        let options: [String: Any] = [
+            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+        ]
+        let trusted = AXIsProcessTrustedWithOptions(options as CFDictionary)
         if !trusted {
-            // Only show the prompt dialog if we don't have permission
-            let options: [String: Any] = [
-                kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
-            ]
-            let promptedTrusted = AXIsProcessTrustedWithOptions(options as CFDictionary)
+            let alert = NSAlert()
+            alert.messageText = "Accessibility Permission Required"
+            alert.informativeText = "CopyMac Clipboard needs accessibility access to register global hotkeys. Please enable it in System Settings > Privacy & Security > Accessibility."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Open System Settings")
+            alert.addButton(withTitle: "Cancel")
             
-            if !promptedTrusted {
-                // Only show our custom alert if the user didn't grant permission through the system prompt
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    let alert = NSAlert()
-                    alert.messageText = "Accessibility Permission Required"
-                    alert.informativeText = "CopyMac Clipboard needs accessibility access to register global hotkeys. Please enable it in System Settings > Privacy & Security > Accessibility."
-                    alert.alertStyle = .warning
-                    alert.addButton(withTitle: "Open System Settings")
-                    alert.addButton(withTitle: "Cancel")
-                    
-                    let response = alert.runModal()
-                    if response == .alertFirstButtonReturn {
-                        self.openAccessibilitySettings()
-                    }
-                }
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                openAccessibilitySettings()
             }
-            return promptedTrusted
         }
-        
         return trusted
     }
     
@@ -816,6 +804,15 @@ class ClipboardViewModel: ObservableObject {
     }
     
     func addShortcut(key: String, modifier: String) {
+        print("Adding shortcut - key: '\(key)', modifier: '\(modifier)'")
+        
+        // Require at least one modifier for Carbon RegisterEventHotKey
+        if modifier == "None" {
+            print("No modifier selected - Carbon requires at least one modifier")
+            toast("Please select a modifier key (⌘, ⌥, ⌃, or ⇧)")
+            return
+        }
+        
         let modifierMap: [String: String] = [
             "Command (⌘)": "⌘",
             "Option (⌥)": "⌥",
@@ -830,8 +827,11 @@ class ClipboardViewModel: ObservableObject {
             "Right Arrow (→)": "→"
         ]
         
-        let fullCombo = modifier == "None" ? key : (modifierMap[modifier] ?? "") + key
+        let fullCombo = (modifierMap[modifier] ?? "") + key
+        print("Full combo created: '\(fullCombo)'")
+        
         if keyboardShortcuts.contains(where: { $0.combo == fullCombo }) {
+            print("Shortcut already exists: \(fullCombo)")
             toast("Shortcut already exists")
             return
         }
@@ -839,9 +839,11 @@ class ClipboardViewModel: ObservableObject {
         if GlobalHotkeyManager.shared.registerHotkey(fullCombo) {
             keyboardShortcuts.append(KeyboardShortcut(combo: fullCombo))
             saveSettings()
-            toast("Shortcut added")
+            print("Shortcut added successfully: \(fullCombo)")
+            toast("Shortcut added: \(fullCombo)")
         } else {
-            toast("Invalid or reserved shortcut")
+            print("Failed to register shortcut: \(fullCombo)")
+            toast("Failed to register shortcut - try a different combination")
         }
     }
     
@@ -853,15 +855,14 @@ class ClipboardViewModel: ObservableObject {
     }
     
     func updateGlobalHotkeys() {
-        // Only try to register if we have permission (don't prompt here)
-        guard AXIsProcessTrusted() else {
-            print("Cannot register hotkeys: Accessibility permission not granted")
-            return
-        }
-        
+        print("Updating all global hotkeys")
         GlobalHotkeyManager.shared.unregisterAllHotkeys()
-        for shortcut in keyboardShortcuts {
-            _ = GlobalHotkeyManager.shared.registerHotkey(shortcut.combo)
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            for shortcut in self.keyboardShortcuts {
+                let success = GlobalHotkeyManager.shared.registerHotkey(shortcut.combo)
+                print("Re-registering shortcut \(shortcut.combo): \(success ? "success" : "failed")")
+            }
         }
     }
     
@@ -1008,12 +1009,11 @@ struct ClipboardAppView: View {
     @StateObject private var hotkeyManager = GlobalHotkeyManager.shared
     @StateObject private var menuBarManager = MenuBarManager()
     @State private var newShortcut: String = ""
-    @State private var selectedHotkey: String = "None"
+    @State private var selectedHotkey: String = "Command (⌘)"
     @State private var manualText: String = ""
     @State private var addToFavorites: Bool = false
     
     private let availableHotkeys = [
-        "None",
         "Command (⌘)",
         "Option (⌥)",
         "Control (⌃)",
@@ -1045,9 +1045,12 @@ struct ClipboardAppView: View {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 
-                // Only register existing hotkeys if we already have permission (don't prompt on startup)
-                if AXIsProcessTrusted() && !vm.keyboardShortcuts.isEmpty {
-                    vm.updateGlobalHotkeys()
+                // Only check permission and register hotkeys if we have saved shortcuts
+                if !vm.keyboardShortcuts.isEmpty {
+                    // Use direct permission check without prompting on startup
+                    if AXIsProcessTrusted() {
+                        vm.updateGlobalHotkeys()
+                    }
                 }
             }
             
