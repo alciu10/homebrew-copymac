@@ -427,41 +427,82 @@ struct ThemeToggle: View {
     @Binding var theme: Theme
     
     var body: some View {
-        Button(action: {
-            theme = theme == .light ? .dark : .light
-        }) {
-            RoundedRectangle(cornerRadius: 25)
-                .fill(theme == .dark ?
-                      LinearGradient(colors: [Color(red: 0.2, green: 0.2, blue: 0.6), Color(red: 0.1, green: 0.1, blue: 0.4)], startPoint: .topLeading, endPoint: .bottomTrailing) :
-                      LinearGradient(colors: [Color(red: 0.4, green: 0.7, blue: 1.0), Color(red: 0.6, green: 0.8, blue: 1.0)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                )
-                .frame(width: 80, height: 40)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 25)
-                        .stroke(Color.gray.opacity(0.3), lineWidth: 1)
-                )
-                .overlay(
-                    HStack {
-                        if theme == .dark {
-                            Spacer()
-                            
-                            Image(systemName: "moon.fill")
-                                .font(.system(size: 16, weight: .medium))
-                                .foregroundColor(.yellow)
-                                .padding(.trailing, 12)
-                        } else {
-                            Image(systemName: "sun.max.fill")
-                                .font(.system(size: 16, weight: .medium))
-                                .foregroundColor(.yellow)
-                                .padding(.leading, 12)
-                            
-                            Spacer()
-                        }
+        HStack(spacing: 16) {
+            // Light Mode Button
+            VStack(spacing: 6) {
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        theme = .light
                     }
-                )
+                }) {
+                    ZStack {
+                        Circle()
+                            .fill(theme == .light ?
+                                  Color.orange.opacity(0.1) :
+                                  Color.gray.opacity(0.05))
+                            .frame(width: 36, height: 36)
+                            .overlay(
+                                Circle()
+                                    .stroke(theme == .light ?
+                                           Color.orange.opacity(0.3) :
+                                           Color.gray.opacity(0.2), lineWidth: 1)
+                            )
+                        
+                        Image(systemName: "sun.max.fill")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(theme == .light ?
+                                           Color.orange :
+                                           Color.gray.opacity(0.6))
+                    }
+                }
+                .buttonStyle(.plain)
+                
+                Text("Light")
+                    .font(.caption2)
+                    .foregroundColor(theme == .light ?
+                                   Color.primary :
+                                   Color.gray.opacity(0.6))
+                    .fontWeight(theme == .light ? .medium : .regular)
+            }
+            
+            // Dark Mode Button
+            VStack(spacing: 6) {
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        theme = .dark
+                    }
+                }) {
+                    ZStack {
+                        Circle()
+                            .fill(theme == .dark ?
+                                  Color.blue.opacity(0.1) :
+                                  Color.gray.opacity(0.05))
+                            .frame(width: 36, height: 36)
+                            .overlay(
+                                Circle()
+                                    .stroke(theme == .dark ?
+                                           Color.blue.opacity(0.3) :
+                                           Color.gray.opacity(0.2), lineWidth: 1)
+                            )
+                        
+                        Image(systemName: "moon.fill")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(theme == .dark ?
+                                           Color.blue :
+                                           Color.gray.opacity(0.6))
+                    }
+                }
+                .buttonStyle(.plain)
+                
+                Text("Dark")
+                    .font(.caption2)
+                    .foregroundColor(theme == .dark ?
+                                   Color.primary :
+                                   Color.gray.opacity(0.6))
+                    .fontWeight(theme == .dark ? .medium : .regular)
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(theme == .dark ? "Switch to Light Mode" : "Switch to Dark Mode")
+        .accessibilityLabel("Theme Selection")
     }
 }
 
@@ -489,6 +530,7 @@ class ClipboardViewModel: ObservableObject {
             debounceSearch()
         }
     }
+    @Published var showReturnToTop = false
     
     private var changeCount = NSPasteboard.general.changeCount
     private let historyKey = "ClipboardHistory"
@@ -501,6 +543,7 @@ class ClipboardViewModel: ObservableObject {
     init() {
         loadSettings()
         loadHistory()
+        
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.pollClipboard()
         }
@@ -531,18 +574,19 @@ class ClipboardViewModel: ObservableObject {
     }
     
     var filteredItems: [ClipboardItem] {
+        // SIMPLE LOGIC - NO COMPLEX SORTING
         let searchLowercased = searchText.lowercased()
-        let filtered = searchText.isEmpty ? items : items.filter { item in
-            item.lowercaseContent.contains(searchLowercased)
-        }
-        return filtered.sorted { first, second in
-            if first.isFavorite != second.isFavorite {
-                return first.isFavorite
+        
+        if searchText.isEmpty {
+            // Return ALL items, favorites first
+            let favorites = items.filter { $0.isFavorite }.sorted { (a, b) in
+                (a.favoritePosition ?? 0) < (b.favoritePosition ?? 0)
             }
-            if first.isFavorite && second.isFavorite {
-                return (first.favoritePosition ?? Int.max) < (second.favoritePosition ?? Int.max)
-            }
-            return first.timestamp > second.timestamp
+            let nonFavorites = items.filter { !$0.isFavorite }.sorted { $0.timestamp > $1.timestamp }
+            return favorites + nonFavorites
+        } else {
+            // Filter by search
+            return items.filter { $0.lowercaseContent.contains(searchLowercased) }
         }
     }
     
@@ -551,71 +595,47 @@ class ClipboardViewModel: ObservableObject {
         if pb.changeCount != changeCount {
             changeCount = pb.changeCount
             
-            if let imageData = pb.data(forType: .png) ?? pb.data(forType: .tiff) {
-                handleNewClipboardContent(imageData: imageData)
-            } else if let str = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !str.isEmpty {
+            if let str = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !str.isEmpty {
                 handleNewClipboardContent(content: str)
+            } else if let imageData = pb.data(forType: .png) ?? pb.data(forType: .tiff) {
+                handleNewClipboardContent(imageData: imageData)
             }
         }
     }
     
     func handleNewClipboardContent(content: String = "", imageData: Data? = nil) {
         if !content.isEmpty {
-            if let existingIndex = items.firstIndex(where: { $0.content == content }) {
-                let existingItem = items[existingIndex]
-                if !existingItem.isFavorite {
-                    items.remove(at: existingIndex)
-                    var updatedItem = existingItem
-                    updatedItem.timestamp = Date()
-                    updatedItem.lowercaseContent = content.lowercased()
-                    let insertionIndex = items.firstIndex(where: { !$0.isFavorite }) ?? items.count
-                    items.insert(updatedItem, at: insertionIndex)
-                }
-                return
+            // Check if this content already exists
+            if items.contains(where: { $0.content == content }) {
+                return // Don't add duplicates
             }
-        } else if let imageData = imageData {
-            if let existingIndex = items.firstIndex(where: { $0.isImage && $0.imageData == imageData }) {
-                let existingItem = items[existingIndex]
-                if !existingItem.isFavorite {
-                    items.remove(at: existingIndex)
-                    var updatedItem = existingItem
-                    updatedItem.timestamp = Date()
-                    let insertionIndex = items.firstIndex(where: { !$0.isFavorite }) ?? items.count
-                    items.insert(updatedItem, at: insertionIndex)
-                }
-                return
-            }
-        }
-        
-        if !content.isEmpty {
             insert(content: content, showToast: false)
         } else if imageData != nil {
+            // Check if this image already exists
+            if items.contains(where: { $0.isImage && $0.imageData == imageData }) {
+                return // Don't add duplicates
+            }
             insert(imageData: imageData, showToast: false)
         }
     }
     
     func insert(content: String = "", imageData: Data? = nil, isFavorite: Bool = false, showToast: Bool = true) {
-        var newItem = ClipboardItem(content: content, imageData: imageData, isFavorite: isFavorite)
+        // DEAD SIMPLE INSERT LOGIC
+        let newItem = ClipboardItem(content: content, imageData: imageData, isFavorite: isFavorite)
         
-        if isFavorite {
-            let maxPosition = items.filter { $0.isFavorite }.compactMap { $0.favoritePosition }.max() ?? -1
-            newItem.favoritePosition = maxPosition + 1
-            items.insert(newItem, at: 0)
-        } else {
-            let insertionIndex = items.firstIndex(where: { !$0.isFavorite }) ?? items.count
-            items.insert(newItem, at: insertionIndex)
-        }
+        // Just add to beginning of array - simple!
+        items.insert(newItem, at: 0)
         
         if showToast {
-            if !content.isEmpty {
-                let toastMessage = isFavorite ? "Favorite Entry Added" : "Entry Added"
-                toast(toastMessage)
-            } else if imageData != nil {
-                toast("Added")
-            }
+            toast(isFavorite ? "Favorite Added" : "Item Added")
         }
+        
         saveHistory()
+        
+        // Force UI update
+        DispatchQueue.main.async {
+            self.objectWillChange.send()
+        }
     }
     
     func copy(_ item: ClipboardItem) {
@@ -630,14 +650,59 @@ class ClipboardViewModel: ObservableObject {
         selectedItem = item
         toast("Copied")
         
+        // Move copied item to top (under favorites) if it's not a favorite
+        if !item.isFavorite {
+            moveItemToTop(item)
+        }
+        
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             GlobalHotkeyManager.shared.hideApp()
         }
     }
     
+    func copyFromPreview(_ item: ClipboardItem) {
+        NSPasteboard.general.clearContents()
+        
+        if item.isImage, let imageData = item.imageData {
+            NSPasteboard.general.setData(imageData, forType: .png)
+        } else {
+            NSPasteboard.general.setString(item.content, forType: .string)
+        }
+        
+        selectedItem = item
+        toast("Copied")
+        
+        // Move copied item to top (under favorites) if it's not a favorite
+        if !item.isFavorite {
+            moveItemToTop(item)
+        }
+        
+        // Don't close the app when copying from preview
+    }
+    
+    private func moveItemToTop(_ item: ClipboardItem) {
+        // Find and remove the item from its current position
+        if let currentIndex = items.firstIndex(where: { $0.id == item.id }) {
+            let itemToMove = items[currentIndex]
+            items.remove(at: currentIndex)
+            
+            // Insert after all favorites (at the top of non-favorites)
+            let favoriteCount = items.filter { $0.isFavorite }.count
+            var updatedItem = itemToMove
+            updatedItem.timestamp = Date() // Update timestamp to mark as recently used
+            items.insert(updatedItem, at: favoriteCount)
+            
+            // Save the updated order
+            saveHistory()
+        }
+    }
+    
     func showPreviewFor(_ item: ClipboardItem) {
-        previewItem = item
-        showPreview = true
+        // Use async to prevent UI blocking
+        DispatchQueue.main.async {
+            self.previewItem = item
+            self.showPreview = true
+        }
     }
     
     func hidePreview() {
@@ -680,8 +745,9 @@ class ClipboardViewModel: ObservableObject {
                 items.insert(updatedItem, at: 0)
             } else {
                 updatedItem.favoritePosition = nil
-                let insertionIndex = items.firstIndex(where: { !$0.isFavorite }) ?? items.count
-                items.insert(updatedItem, at: insertionIndex)
+                // Insert after all favorites
+                let favoriteCount = items.filter { $0.isFavorite }.count
+                items.insert(updatedItem, at: favoriteCount)
             }
             saveHistory()
         }
@@ -859,8 +925,8 @@ class ClipboardViewModel: ObservableObject {
                     updatedItem.favoritePosition = maxPosition + 1
                     items.insert(updatedItem, at: 0)
                 } else {
-                    let insertionIndex = items.firstIndex(where: { !$0.isFavorite }) ?? items.count
-                    items.insert(item, at: insertionIndex)
+                    let favoriteCount = items.filter { $0.isFavorite }.count
+                    items.insert(item, at: favoriteCount)
                 }
             }
         }
@@ -943,7 +1009,7 @@ struct ClipboardAppView: View {
             VStack(spacing: 0) {
                 header
                 Divider()
-                contentList
+                mainContent
             }
             .preferredColorScheme(vm.theme.colorScheme)
             .frame(
@@ -1007,6 +1073,28 @@ struct ClipboardAppView: View {
             
             Spacer()
             
+            // Return to Top Button with app icon styling (smaller)
+            Button(action: {
+                NotificationCenter.default.post(name: NSNotification.Name("ScrollToTop"), object: nil)
+            }) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(LinearGradient(
+                            colors: [Color.blue, Color.purple],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ))
+                        .frame(width: 18, height: 18)
+                    
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.white)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Return to Top")
+            
             Button(action: { vm.showSettings.toggle() }) {
                 Image(systemName: "ellipsis")
                     .font(.title2)
@@ -1020,380 +1108,459 @@ struct ClipboardAppView: View {
         .padding(.vertical, 1)
     }
     
-    var contentList: some View {
+    var mainContent: some View {
         VStack {
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    if vm.filteredItems.isEmpty {
-                        VStack(spacing: 16) {
-                            Image(systemName: "doc.on.clipboard")
-                                .font(.system(size: 48))
-                                .foregroundColor(.gray)
-                            Text(vm.searchText.isEmpty ? "Boost your productivity!" : "No matching items found")
-                                .font(.headline)
-                                .foregroundColor(.gray)
-                        }
-                        .padding(.top, 60)
-                    } else {
-                        ForEach(Array(vm.filteredItems.enumerated()), id: \.1.id) { index, item in
-                            HStack(spacing: 2) {
-                                Text(String(format: "%d.", index + 1))
-                                    .font(.system(size: 10, design: .monospaced))
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        if vm.filteredItems.isEmpty {
+                            VStack(spacing: 16) {
+                                Image(systemName: "doc.on.clipboard")
+                                    .font(.system(size: 48))
                                     .foregroundColor(.gray)
                                 
-                                if item.isImage {
-                                    HStack {
-                                        Text("Image")
-                                            .font(.system(size: 10))
-                                            .foregroundColor(.primary)
-                                        
-                                        if let imageData = item.imageData, let nsImage = NSImage(data: imageData) {
-                                            Image(nsImage: nsImage)
-                                                .resizable()
-                                                .aspectRatio(contentMode: .fit)
-                                                .frame(width: 20, height: 15)
-                                                .clipShape(RoundedRectangle(cornerRadius: 3))
-                                        } else {
-                                            Image(systemName: "photo")
-                                                .foregroundColor(.blue)
-                                                .frame(width: 20, height: 15)
-                                        }
-                                        
-                                        Spacer()
-                                        
-                                        if item.isFavorite {
-                                            Image(systemName: "star.fill")
-                                                .font(.system(size: 10))
-                                                .foregroundColor(.yellow)
-                                        }
-                                    }
+                                if vm.searchText.isEmpty {
+                                    Text("Copy some text to get started!")
+                                        .font(.headline)
+                                        .foregroundColor(.gray)
                                 } else {
-                                    HStack {
-                                        Text(item.content.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\t", with: " "))
-                                            .font(.system(size: 11))
-                                            .lineLimit(1)
-                                            .truncationMode(.tail)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                        
-                                        if item.isFavorite {
-                                            Image(systemName: "star.fill")
-                                                .font(.system(size: 10))
-                                                .foregroundColor(.yellow)
-                                        }
-                                    }
+                                    Text("No matching items found")
+                                        .font(.headline)
+                                        .foregroundColor(.gray)
+                                    Text("Try a different search term")
+                                        .font(.subheadline)
+                                        .foregroundColor(.gray)
                                 }
                             }
-                            .frame(maxWidth: .infinity, alignment: .topLeading)
-                            .padding(.horizontal, 8)
-                            .padding(.top, 0)
-                            .padding(.bottom, 24)
-                            .background(
-                                vm.selectedItem?.id == item.id ? Color.blue.opacity(0.5) :
-                                vm.highlightedItem?.id == item.id ? Color.blue.opacity(0.25) :
-                                index % 2 == 0 ?
-                                    (vm.theme == .dark ? Color(red: 0.05, green: 0.05, blue: 0.05) : Color(red: 0.88, green: 0.88, blue: 0.88)) :
-                                    (vm.theme == .dark ? Color(red: 0.18, green: 0.18, blue: 0.18) : Color(red: 0.76, green: 0.76, blue: 0.76))
-                            )
-                            .cornerRadius(3)
-                            .padding(.horizontal, 1)
-                            .onTapGesture {
-                                vm.handleItemTap(item)
-                            }
-                            .contextMenu {
-                                Button("Preview") {
-                                    vm.showPreviewFor(item)
-                                }
-                                Button("Copy") {
-                                    vm.copy(item)
-                                }
-                                
-                                Divider()
-                                
-                                if item.isFavorite {
-                                    Button("Move Up") {
-                                        vm.moveFavoriteUp(item)
-                                    }
-                                    .disabled(vm.items.filter { $0.isFavorite }.first?.id == item.id)
-                                    
-                                    Button("Move Down") {
-                                        vm.moveFavoriteDown(item)
-                                    }
-                                    .disabled(vm.items.filter { $0.isFavorite }.last?.id == item.id)
-                                    
-                                    Divider()
-                                    
-                                    Button("Remove from Favorites") {
-                                        vm.toggleFavorite(item)
-                                    }
-                                } else {
-                                    Button("Add to Favorites") {
-                                        vm.toggleFavorite(item)
-                                    }
-                                }
-                                
-                                Divider()
-                                
-                                Button("Delete") {
-                                    vm.delete(item)
-                                }
+                            .padding(.top, 60)
+                            .id("topAnchor")
+                        } else {
+                            // Top anchor for scrolling
+                            Color.clear
+                                .frame(height: 1)
+                                .id("topAnchor")
+                            
+                            ForEach(Array(vm.filteredItems.enumerated()), id: \.1.id) { index, item in
+                                itemRow(item: item, index: index)
                             }
                         }
+                    }
+                }
+                .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ScrollToTop"))) { _ in
+                    withAnimation(.easeOut(duration: 0.3)) {
+                        proxy.scrollTo("topAnchor", anchor: .top)
                     }
                 }
             }
             
-            HStack {
-                Image(systemName: "magnifyingglass")
-                    .foregroundColor(.gray)
-                TextField("Search Clipboard Items", text: $vm.searchText)
-                    .textFieldStyle(.plain)
-                    .padding(.vertical, 4)
-                    .padding(.horizontal, 8)
-                    .background(Color(NSColor.controlBackgroundColor))
-                    .cornerRadius(8)
-                    .disabled(vm.showSettings)
-                if !vm.searchText.isEmpty {
-                    Button {
-                        vm.searchText = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.gray)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Clear Search")
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.bottom, 12)
-            .padding(.top, 3)
+            searchBar
         }
     }
     
+    func itemRow(item: ClipboardItem, index: Int) -> some View {
+        HStack(spacing: 2) {
+            Text(String(format: "%d.", index + 1))
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(.gray)
+            
+            if item.isImage {
+                imageContent(item: item)
+            } else {
+                textContent(item: item)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .padding(.horizontal, 8)
+        .padding(.top, 0)
+        .padding(.bottom, 24)
+        .background(rowBackground(item: item, index: index))
+        .cornerRadius(3)
+        .padding(.horizontal, 1)
+        .onTapGesture {
+            vm.handleItemTap(item)
+        }
+        .contextMenu {
+            contextMenuContent(item: item)
+        }
+    }
+    
+    func imageContent(item: ClipboardItem) -> some View {
+        HStack {
+            Text("Image")
+                .font(.system(size: 10))
+                .foregroundColor(.primary)
+            
+            if let imageData = item.imageData, let nsImage = NSImage(data: imageData) {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 20, height: 15)
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+            } else {
+                Image(systemName: "photo")
+                    .foregroundColor(.blue)
+                    .frame(width: 20, height: 15)
+            }
+            
+            Spacer()
+            
+            if item.isFavorite {
+                Image(systemName: "star.fill")
+                    .font(.system(size: 10))
+                    .foregroundColor(.yellow)
+            }
+        }
+    }
+    
+    func textContent(item: ClipboardItem) -> some View {
+        HStack {
+            // Optimize long text display in list by truncating for display only
+            let displayText = item.content.count > 500 ?
+                String(item.content.prefix(500)) + "..." :
+                item.content
+            
+            Text(displayText.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\t", with: " "))
+                .font(.system(size: 11))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            
+            if item.isFavorite {
+                Image(systemName: "star.fill")
+                    .font(.system(size: 10))
+                    .foregroundColor(.yellow)
+            }
+        }
+    }
+    
+    func rowBackground(item: ClipboardItem, index: Int) -> Color {
+        if vm.selectedItem?.id == item.id {
+            return Color.blue.opacity(0.5)
+        } else if vm.highlightedItem?.id == item.id {
+            return Color.blue.opacity(0.25)
+        } else if index % 2 == 0 {
+            return vm.theme == .dark ?
+                Color(red: 0.08, green: 0.08, blue: 0.08) :
+                Color(red: 0.82, green: 0.82, blue: 0.82)
+        } else {
+            return vm.theme == .dark ?
+                Color(red: 0.12, green: 0.12, blue: 0.12) :
+                Color(red: 0.88, green: 0.88, blue: 0.88)
+        }
+    }
+    
+    @ViewBuilder
+    func contextMenuContent(item: ClipboardItem) -> some View {
+        Button("Preview") {
+            vm.showPreviewFor(item)
+        }
+        Button("Copy") {
+            vm.copy(item)
+        }
+        
+        Divider()
+        
+        if item.isFavorite {
+            Button("Move Up") {
+                vm.moveFavoriteUp(item)
+            }
+            .disabled(vm.items.filter { $0.isFavorite }.first?.id == item.id)
+            
+            Button("Move Down") {
+                vm.moveFavoriteDown(item)
+            }
+            .disabled(vm.items.filter { $0.isFavorite }.last?.id == item.id)
+            
+            Divider()
+            
+            Button("Remove from Favorites") {
+                vm.toggleFavorite(item)
+            }
+        } else {
+            Button("Add to Favorites") {
+                vm.toggleFavorite(item)
+            }
+        }
+        
+        Divider()
+        
+        Button("Delete") {
+            vm.delete(item)
+        }
+    }
+    
+    var searchBar: some View {
+        HStack {
+            Image(systemName: "magnifyingglass")
+                .foregroundColor(.gray)
+            TextField("Search Clipboard Items", text: $vm.searchText)
+                .textFieldStyle(.plain)
+                .padding(.vertical, 4)
+                .padding(.horizontal, 8)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(8)
+                .disabled(vm.showSettings)
+            if !vm.searchText.isEmpty {
+                Button {
+                    vm.searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.gray)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear Search")
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.bottom, 12)
+        .padding(.top, 3)
+    }
+    
     var settingsPanel: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+        VStack(spacing: 0) {
+            // Sticky Header
+            VStack(spacing: 16) {
                 HStack {
                     Text("Settings").font(.headline)
                     Spacer()
                     Button {
                         vm.showSettings = false
                     } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.title3)
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 5)
+                                .fill(LinearGradient(
+                                    colors: [Color.blue, Color.purple],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                ))
+                                .frame(width: 18, height: 18)
+                            
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(.white)
+                        }
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Close Settings")
                 }
-                
-                Divider()
-                
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Add Manual Entry")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    
-                    HStack(spacing: 8) {
-                        TextField("Enter text to add to clipboard history", text: $manualText)
-                            .textFieldStyle(.plain)
-                            .padding(.vertical, 8)
-                            .padding(.horizontal, 12)
-                            .background(Color(NSColor.controlBackgroundColor))
-                            .cornerRadius(8)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(manualText.isEmpty ? Color.clear : Color.blue, lineWidth: 2)
-                            )
-                        
-                        Button("Add") {
-                            if !manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                vm.insert(content: manualText, isFavorite: addToFavorites, showToast: true)
-                                manualText = ""
-                                addToFavorites = false
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }
-                    
-                    Toggle("Add to favorites", isOn: $addToFavorites)
-                        .font(.caption)
-                }
-                
-                Divider()
-                
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Theme")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    
-                    ThemeToggle(theme: $vm.theme)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    
-                    Text("Choose between light and dark appearance")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                
-                Divider()
-                
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("Global Shortcuts")
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 8)
+            .background(Color(.windowBackgroundColor))
+            
+            Divider()
+            
+            // Scrollable Content
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Add Manual Entry")
                             .font(.subheadline)
-                            .fontWeight(.medium)
+                            .fontWeight(.bold)
                         
-                        Spacer()
-                        
-                        HStack(spacing: 4) {
-                            Circle()
-                                .fill(hotkeyManager.isRegistered ? Color.green : Color.red)
-                                .frame(width: 6, height: 6)
-                            Text(hotkeyManager.isRegistered ? "Active" : "Inactive")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
+                        HStack(spacing: 8) {
+                            TextField("Type your text here", text: $manualText)
+                                .textFieldStyle(.plain)
+                                .padding(.vertical, 8)
+                                .padding(.horizontal, 12)
+                                .background(Color(NSColor.controlBackgroundColor))
+                                .cornerRadius(8)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(manualText.isEmpty ? Color.clear : Color.blue, lineWidth: 2)
+                                )
+                            
+                            Button("Add") {
+                                if !manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    vm.insert(content: manualText, isFavorite: addToFavorites, showToast: true)
+                                    manualText = ""
+                                    addToFavorites = false
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
+                        
+                        Toggle("Add to favorites", isOn: $addToFavorites)
+                            .font(.caption)
                     }
                     
-                    ForEach(vm.keyboardShortcuts) { shortcut in
+                    Divider()
+                    
+                    VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text(shortcut.combo)
-                                .font(.system(size: 13, design: .monospaced))
-                                .padding(6)
-                                .background(Color(NSColor.controlBackgroundColor))
-                                .cornerRadius(4)
+                            Text("Global Shortcuts")
+                                .font(.subheadline)
+                                .fontWeight(.bold)
                             
                             Spacer()
                             
-                            Button {
-                                vm.removeShortcut(shortcut.combo)
-                            } label: {
-                                Image(systemName: "minus.circle.fill")
-                                    .foregroundColor(.red)
+                            HStack(spacing: 4) {
+                                Circle()
+                                    .fill(hotkeyManager.isRegistered ? Color.green : Color.red)
+                                    .frame(width: 6, height: 6)
+                                Text(hotkeyManager.isRegistered ? "Active" : "Inactive")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
                             }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Add New Shortcut")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        
-                        HStack {
-                            TextField("e.g., ` or §", text: $newShortcut)
-                                .textFieldStyle(.plain)
-                                .padding(.vertical, 6)
-                                .padding(.horizontal, 8)
-                                .background(Color(NSColor.controlBackgroundColor))
-                                .cornerRadius(8)
-                            
-                            Picker("", selection: $selectedHotkey) {
-                                ForEach(availableHotkeys, id: \.self) { hotkey in
-                                    Text(hotkey).tag(hotkey)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            .frame(width: 150)
                         }
                         
-                        Button("Add") {
-                            if !newShortcut.isEmpty {
-                                vm.addShortcut(key: newShortcut, modifier: selectedHotkey)
-                                newShortcut = ""
-                                selectedHotkey = "None"
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(newShortcut.isEmpty)
-                    }
-                    .padding(.top, 8)
-                    
-                    if !hotkeyManager.isRegistered && !AXIsProcessTrusted() {
-                        HStack {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundColor(.orange)
-                                .font(.caption)
-                            
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Accessibility permission required")
-                                    .font(.caption)
-                                    .foregroundColor(.orange)
+                        ForEach(vm.keyboardShortcuts) { shortcut in
+                            HStack {
+                                Text(shortcut.combo)
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .padding(6)
+                                    .background(Color(NSColor.controlBackgroundColor))
+                                    .cornerRadius(4)
                                 
-                                Button("Open System Settings") {
-                                    hotkeyManager.openAccessibilitySettings()
+                                Spacer()
+                                
+                                Button {
+                                    vm.removeShortcut(shortcut.combo)
+                                } label: {
+                                    Image(systemName: "minus.circle.fill")
+                                        .foregroundColor(.red)
                                 }
-                                .font(.caption)
-                                .buttonStyle(.bordered)
+                                .buttonStyle(.plain)
                             }
                         }
-                        .padding(8)
-                        .background(Color.orange.opacity(0.1))
-                        .cornerRadius(8)
-                    }
-                }
-                
-                Divider()
-                
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Import/Export")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    
-                    HStack(spacing: 12) {
-                        Button("Export History") {
-                            vm.exportHistory()
-                        }
-                        .buttonStyle(.borderedProminent)
                         
-                        Button("Import History") {
-                            vm.importHistory()
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                }
-                
-                Divider()
-                
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Clear History")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    
-                    Button("Clear") {
-                        vm.showClearConfirm = true
-                    }
-                    .foregroundColor(.red)
-                    
-                    if vm.showClearConfirm {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Clear all clipboard items (excluding favorites)?")
+                            Text("Add New Shortcut")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
+                            
                             HStack {
-                                Button("Cancel") {
-                                    vm.showClearConfirm = false
+                                TextField("e.g., ` or §", text: $newShortcut)
+                                    .textFieldStyle(.plain)
+                                    .padding(.vertical, 6)
+                                    .padding(.horizontal, 8)
+                                    .background(Color(NSColor.controlBackgroundColor))
+                                    .cornerRadius(8)
+                                
+                                Picker("", selection: $selectedHotkey) {
+                                    ForEach(availableHotkeys, id: \.self) { hotkey in
+                                        Text(hotkey).tag(hotkey)
+                                    }
                                 }
-                                Button("Confirm") {
-                                    vm.clearNonFavorites()
-                                    vm.showClearConfirm = false
-                                }
-                                .foregroundColor(.red)
+                                .pickerStyle(.menu)
+                                .frame(width: 150)
                             }
+                            
+                            Button("Add") {
+                                if !newShortcut.isEmpty {
+                                    vm.addShortcut(key: newShortcut, modifier: selectedHotkey)
+                                    newShortcut = ""
+                                    selectedHotkey = "None"
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(newShortcut.isEmpty)
                         }
-                        .padding(8)
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .cornerRadius(6)
+                        .padding(.top, 8)
+                        
+                        if !hotkeyManager.isRegistered && !AXIsProcessTrusted() {
+                            HStack {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                                    .font(.caption)
+                                
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Accessibility permission required")
+                                        .font(.caption)
+                                        .foregroundColor(.orange)
+                                    
+                                    Button("Open System Settings") {
+                                        hotkeyManager.openAccessibilitySettings()
+                                    }
+                                    .font(.caption)
+                                    .buttonStyle(.bordered)
+                                }
+                            }
+                            .padding(8)
+                            .background(Color.orange.opacity(0.1))
+                            .cornerRadius(8)
+                        }
                     }
+                    
+                    Divider()
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Theme")
+                            .font(.subheadline)
+                            .fontWeight(.bold)
+                        
+                        ThemeToggle(theme: $vm.theme)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    
+                    Divider()
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Import/Export")
+                            .font(.subheadline)
+                            .fontWeight(.bold)
+                        
+                        HStack(spacing: 12) {
+                            Button("Export History") {
+                                vm.exportHistory()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            
+                            Button("Import History") {
+                                vm.importHistory()
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+                    
+                    Divider()
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Clear History")
+                            .font(.subheadline)
+                            .fontWeight(.bold)
+                        
+                        Button("Clear") {
+                            vm.showClearConfirm = true
+                        }
+                        .foregroundColor(.red)
+                        
+                        if vm.showClearConfirm {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Clear all clipboard items (excluding favorites)?")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                HStack {
+                                    Button("Cancel") {
+                                        vm.showClearConfirm = false
+                                    }
+                                    Button("Confirm") {
+                                        vm.clearNonFavorites()
+                                        vm.showClearConfirm = false
+                                    }
+                                    .foregroundColor(.red)
+                                }
+                            }
+                            .padding(8)
+                            .background(Color(NSColor.controlBackgroundColor))
+                            .cornerRadius(6)
+                        }
+                    }
+                    
+                    Text("Version v1.5.0")
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                    
+                    Spacer()
+                        .frame(height: 2)
                 }
-                
-                Text("Version v1.4.0")
-                    .font(.caption)
-                    .foregroundColor(.gray)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                
-                Spacer(minLength: 20)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 16)
             }
-            .padding(16)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(.windowBackgroundColor))
@@ -1412,8 +1579,20 @@ struct ClipboardAppView: View {
                 Button {
                     vm.hidePreview()
                 } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title3)
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(LinearGradient(
+                                colors: [Color.blue, Color.purple],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ))
+                            .frame(width: 18, height: 18)
+                        
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.white)
+                    }
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Close Preview")
@@ -1453,19 +1632,41 @@ struct ClipboardAppView: View {
                             }
                         }
                         
+                        // Optimized text display with chunking for very long content
                         ScrollView {
-                            Text(item.content)
-                                .font(.system(size: 13))
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                            if item.content.count > 50000 {
+                                // For very long text, use chunked loading
+                                LazyVStack(alignment: .leading, spacing: 4) {
+                                    ForEach(0..<min(50, item.content.count / 1000), id: \.self) { chunkIndex in
+                                        let startIndex = chunkIndex * 1000
+                                        let endIndex = min(startIndex + 1000, item.content.count)
+                                        let chunk = String(item.content[item.content.index(item.content.startIndex, offsetBy: startIndex)..<item.content.index(item.content.startIndex, offsetBy: endIndex)])
+                                        
+                                        Text(chunk)
+                                            .font(.system(size: 13, design: .monospaced))
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .textSelection(.enabled)
+                                    }
+                                }
                                 .padding(8)
                                 .background(Color(NSColor.controlBackgroundColor))
                                 .cornerRadius(6)
+                            } else {
+                                // For normal text, use regular display
+                                Text(item.content)
+                                    .font(.system(size: 13))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(8)
+                                    .background(Color(NSColor.controlBackgroundColor))
+                                    .cornerRadius(6)
+                                    .textSelection(.enabled)
+                            }
                         }
                         .frame(maxHeight: vm.currentDimensions.height * 0.5)
                         
                         HStack {
                             Button("Copy") {
-                                vm.copy(item)
+                                vm.copyFromPreview(item)
                                 vm.hidePreview()
                             }
                             .buttonStyle(.borderedProminent)
