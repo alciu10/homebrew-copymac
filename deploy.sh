@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # CopyMac Fast Deploy Script
-# Usage: ./deploy.sh 1.5.0
+# Usage: ./deploy.sh 1.5.1
 
 set -e  # Exit on any error
 
 # Check if version is provided
 if [ $# -eq 0 ]; then
     echo "❌ Error: Please provide a version number"
-    echo "Usage: ./deploy.sh 1.5.0"
+    echo "Usage: ./deploy.sh 1.5.1"
     exit 1
 fi
 
