@@ -315,23 +315,35 @@ class GlobalHotkeyManager: ObservableObject {
     }
     
     func checkAccessibilityPermission() -> Bool {
-        let options: [String: Any] = [
-            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
-        ]
-        let trusted = AXIsProcessTrustedWithOptions(options as CFDictionary)
+        // First check without prompting
+        let trusted = AXIsProcessTrusted()
+        
         if !trusted {
-            let alert = NSAlert()
-            alert.messageText = "Accessibility Permission Required"
-            alert.informativeText = "CopyMac Clipboard needs accessibility access to register global hotkeys. Please enable it in System Settings > Privacy & Security > Accessibility."
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "Open System Settings")
-            alert.addButton(withTitle: "Cancel")
+            // Only show the prompt dialog if we don't have permission
+            let options: [String: Any] = [
+                kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+            ]
+            let promptedTrusted = AXIsProcessTrustedWithOptions(options as CFDictionary)
             
-            let response = alert.runModal()
-            if response == .alertFirstButtonReturn {
-                openAccessibilitySettings()
+            if !promptedTrusted {
+                // Only show our custom alert if the user didn't grant permission through the system prompt
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    let alert = NSAlert()
+                    alert.messageText = "Accessibility Permission Required"
+                    alert.informativeText = "CopyMac Clipboard needs accessibility access to register global hotkeys. Please enable it in System Settings > Privacy & Security > Accessibility."
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "Open System Settings")
+                    alert.addButton(withTitle: "Cancel")
+                    
+                    let response = alert.runModal()
+                    if response == .alertFirstButtonReturn {
+                        self.openAccessibilitySettings()
+                    }
+                }
             }
+            return promptedTrusted
         }
+        
         return trusted
     }
     
@@ -841,6 +853,12 @@ class ClipboardViewModel: ObservableObject {
     }
     
     func updateGlobalHotkeys() {
+        // Only try to register if we have permission (don't prompt here)
+        guard AXIsProcessTrusted() else {
+            print("Cannot register hotkeys: Accessibility permission not granted")
+            return
+        }
+        
         GlobalHotkeyManager.shared.unregisterAllHotkeys()
         for shortcut in keyboardShortcuts {
             _ = GlobalHotkeyManager.shared.registerHotkey(shortcut.combo)
@@ -1027,7 +1045,8 @@ struct ClipboardAppView: View {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 
-                if hotkeyManager.checkAccessibilityPermission() && !vm.keyboardShortcuts.isEmpty {
+                // Only register existing hotkeys if we already have permission (don't prompt on startup)
+                if AXIsProcessTrusted() && !vm.keyboardShortcuts.isEmpty {
                     vm.updateGlobalHotkeys()
                 }
             }
@@ -1555,7 +1574,7 @@ struct ClipboardAppView: View {
                         }
                     }
                     
-                    Text("Version v1.5.1")
+                    Text("Version v1.5.2")
                         .font(.caption)
                         .foregroundColor(.gray)
                         .frame(maxWidth: .infinity, alignment: .center)
