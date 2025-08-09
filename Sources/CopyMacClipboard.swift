@@ -59,12 +59,17 @@ extension NSWindow {
     }
 }
 
-// MARK: - Menu Bar Manager (Simplified)
+// MARK: - Menu Bar Manager
 class MenuBarManager: ObservableObject {
     private var statusItem: NSStatusItem?
     
     func createMenuBarIcon() {
-        return
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem?.button {
+            button.image = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "CopyMac")
+            button.action = #selector(menuBarClicked)
+            button.target = self
+        }
     }
     
     func removeMenuBarIcon() {
@@ -81,7 +86,7 @@ class MenuBarManager: ObservableObject {
     }
 }
 
-// MARK: - Global Hotkey Manager (Simplified)
+// MARK: - Global Hotkey Manager (Enhanced with better permission handling)
 class GlobalHotkeyManager: ObservableObject {
     static let shared = GlobalHotkeyManager()
     private var hotkeyRefs: [String: EventHotKeyRef] = [:]
