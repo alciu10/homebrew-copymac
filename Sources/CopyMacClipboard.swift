@@ -1,4 +1,22 @@
-import SwiftUI
+if !hotkeyManager.isRegistered && !GlobalHotkeyManager.shared.hasAccessibilityPermission() {
+                            HStack {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                                    .font(.caption)
+                                
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Accessibility permission required")
+                                        .font(.caption)
+                                        .foregroundColor(.orange)
+                                    
+                                    Button("Open System Settings") {
+                                        hotkeyManager.openAccessibilitySettings()
+                                    }
+                                    .font(.caption)
+                                    .buttonStyle(.bordered)
+                                }
+                            }
+                            .padding(8)import SwiftUI
 import AppKit
 import Carbon
 import Foundation
@@ -86,13 +104,14 @@ class MenuBarManager: ObservableObject {
     }
 }
 
-// MARK: - Global Hotkey Manager (Enhanced with better permission handling)
+// MARK: - Global Hotkey Manager (Completely Rewritten)
 class GlobalHotkeyManager: ObservableObject {
     static let shared = GlobalHotkeyManager()
     private var hotkeyRefs: [String: EventHotKeyRef] = [:]
     private var isAppVisible = false
     @Published var isRegistered = false
     private var eventHandler: EventHandlerRef?
+    private var permissionChecked = false
 
     private init() {
         setupEventHandler()
@@ -200,9 +219,42 @@ class GlobalHotkeyManager: ObservableObject {
         }
     }
     
+    // SIMPLIFIED PERMISSION CHECK - NO PROMPTS
+    func hasAccessibilityPermission() -> Bool {
+        return AXIsProcessTrusted()
+    }
+    
+    // ONLY REQUEST PERMISSION WHEN EXPLICITLY CALLED
+    func requestAccessibilityPermission() -> Bool {
+        if hasAccessibilityPermission() {
+            return true
+        }
+        
+        // Only show system prompt once
+        if !permissionChecked {
+            permissionChecked = true
+            let options: [String: Any] = [
+                kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+            ]
+            let result = AXIsProcessTrustedWithOptions(options as CFDictionary)
+            
+            // Give it a moment to process
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                self.permissionChecked = false // Reset for next time
+            }
+            
+            return result
+        }
+        
+        return false
+    }
+    
     func registerHotkey(_ keyCombo: String) -> Bool {
-        guard checkAccessibilityPermission() else {
-            print("Hotkey registration failed: Accessibility permission denied")
+        print("Attempting to register hotkey: \(keyCombo)")
+        
+        // Check if we have permission first
+        guard hasAccessibilityPermission() else {
+            print("Hotkey registration failed: No accessibility permission")
             isRegistered = false
             return false
         }
@@ -312,27 +364,6 @@ class GlobalHotkeyManager: ObservableObject {
         ]
         
         return keyMap[char]
-    }
-    
-    func checkAccessibilityPermission() -> Bool {
-        let options: [String: Any] = [
-            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
-        ]
-        let trusted = AXIsProcessTrustedWithOptions(options as CFDictionary)
-        if !trusted {
-            let alert = NSAlert()
-            alert.messageText = "Accessibility Permission Required"
-            alert.informativeText = "CopyMac Clipboard needs accessibility access to register global hotkeys. Please enable it in System Settings > Privacy & Security > Accessibility."
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "Open System Settings")
-            alert.addButton(withTitle: "Cancel")
-            
-            let response = alert.runModal()
-            if response == .alertFirstButtonReturn {
-                openAccessibilitySettings()
-            }
-        }
-        return trusted
     }
     
     func openAccessibilitySettings() {
@@ -836,6 +867,24 @@ class ClipboardViewModel: ObservableObject {
             return
         }
         
+        // Check permission without prompting first
+        if !GlobalHotkeyManager.shared.hasAccessibilityPermission() {
+            // Request permission (this will show the system dialog)
+            if !GlobalHotkeyManager.shared.requestAccessibilityPermission() {
+                toast("Accessibility permission required - please grant it and try again")
+                return
+            }
+            
+            // Wait a moment for permission to be processed
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.attemptHotkeyRegistration(fullCombo: fullCombo)
+            }
+        } else {
+            attemptHotkeyRegistration(fullCombo: fullCombo)
+        }
+    }
+    
+    private func attemptHotkeyRegistration(fullCombo: String) {
         if GlobalHotkeyManager.shared.registerHotkey(fullCombo) {
             keyboardShortcuts.append(KeyboardShortcut(combo: fullCombo))
             saveSettings()
@@ -857,6 +906,12 @@ class ClipboardViewModel: ObservableObject {
     func updateGlobalHotkeys() {
         print("Updating all global hotkeys")
         GlobalHotkeyManager.shared.unregisterAllHotkeys()
+        
+        // Only register if we already have permission (no prompting here)
+        guard GlobalHotkeyManager.shared.hasAccessibilityPermission() else {
+            print("Cannot register hotkeys: No accessibility permission")
+            return
+        }
         
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             for shortcut in self.keyboardShortcuts {
@@ -1045,12 +1100,9 @@ struct ClipboardAppView: View {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 
-                // Only check permission and register hotkeys if we have saved shortcuts
-                if !vm.keyboardShortcuts.isEmpty {
-                    // Use direct permission check without prompting on startup
-                    if AXIsProcessTrusted() {
-                        vm.updateGlobalHotkeys()
-                    }
+                // Only register existing shortcuts if permission is already granted (no prompts on startup)
+                if !vm.keyboardShortcuts.isEmpty && GlobalHotkeyManager.shared.hasAccessibilityPermission() {
+                    vm.updateGlobalHotkeys()
                 }
             }
             
@@ -1488,7 +1540,7 @@ struct ClipboardAppView: View {
                         }
                         .padding(.top, 8)
                         
-                        if !hotkeyManager.isRegistered && !AXIsProcessTrusted() {
+                        if !hotkeyManager.isRegistered && !GlobalHotkeyManager.shared.hasAccessibilityPermission() {
                             HStack {
                                 Image(systemName: "exclamationmark.triangle.fill")
                                     .foregroundColor(.orange)
@@ -1577,7 +1629,7 @@ struct ClipboardAppView: View {
                         }
                     }
                     
-                    Text("Version v1.5.3")
+                    Text("Version v1.5.0")
                         .font(.caption)
                         .foregroundColor(.gray)
                         .frame(maxWidth: .infinity, alignment: .center)
