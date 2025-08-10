@@ -61,15 +61,22 @@ extension NSWindow {
 
 // MARK: - Menu Bar Manager
 class MenuBarManager: ObservableObject {
+    static let shared = MenuBarManager()
     private var statusItem: NSStatusItem?
+    @Published var isMenuBarEnabled = false
+    
+    private init() {}
     
     func createMenuBarIcon() {
+        guard statusItem == nil else { return }
+        
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem?.button {
             button.image = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "CopyMac")
             button.action = #selector(menuBarClicked)
             button.target = self
         }
+        isMenuBarEnabled = true
     }
     
     func removeMenuBarIcon() {
@@ -77,6 +84,7 @@ class MenuBarManager: ObservableObject {
             NSStatusBar.system.removeStatusItem(statusItem)
             self.statusItem = nil
         }
+        isMenuBarEnabled = false
     }
     
     @objc private func menuBarClicked() {
@@ -92,11 +100,14 @@ class GlobalHotkeyManager: ObservableObject {
     private var hotkeyRefs: [String: EventHotKeyRef] = [:]
     private var isAppVisible = false
     @Published var isRegistered = false
+    @Published var permissionGranted = false
     private var eventHandler: EventHandlerRef?
-    private static var permissionRequestInProgress = false  // Static to ensure single instance
+    private static var permissionRequestInProgress = false
+    private var permissionCheckTimer: Timer?
 
     private init() {
         setupEventHandler()
+        startPermissionMonitoring()
     }
 
     private func setupEventHandler() {
@@ -148,6 +159,32 @@ class GlobalHotkeyManager: ObservableObject {
         }
         return noErr
     }
+    
+    private func startPermissionMonitoring() {
+        // Check permission status every 2 seconds
+        permissionCheckTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.updatePermissionStatus()
+        }
+        // Initial check
+        updatePermissionStatus()
+    }
+    
+    private func updatePermissionStatus() {
+        let wasGranted = permissionGranted
+        permissionGranted = AXIsProcessTrusted()
+        
+        if !wasGranted && permissionGranted {
+            // Permission was just granted
+            print("Accessibility permission granted!")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: NSNotification.Name("AccessibilityPermissionGranted"), object: nil)
+            }
+        } else if wasGranted && !permissionGranted {
+            // Permission was revoked
+            print("Accessibility permission revoked")
+            unregisterAllHotkeys()
+        }
+    }
 
     func toggleAppVisibility() {
         DispatchQueue.main.async {
@@ -196,19 +233,15 @@ class GlobalHotkeyManager: ObservableObject {
             NSApp.setActivationPolicy(.accessory)
             self.isAppVisible = false
             
-            // Clear any selected/highlighted items when hiding the app
             NotificationCenter.default.post(name: NSNotification.Name("AppWillHide"), object: nil)
         }
     }
     
-    // SIMPLIFIED PERMISSION CHECK - NO PROMPTS
     func hasAccessibilityPermission() -> Bool {
         return AXIsProcessTrusted()
     }
     
-    // FIXED: Only request permission once at a time
     func requestAccessibilityPermission() {
-        // Prevent multiple simultaneous permission requests
         guard !Self.permissionRequestInProgress else {
             print("Permission request already in progress")
             return
@@ -216,36 +249,19 @@ class GlobalHotkeyManager: ObservableObject {
         
         Self.permissionRequestInProgress = true
         
-        // This will show the system prompt if permission not granted
         let options: [String: Any] = [
             kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
         ]
         _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
         
-        // Reset flag after a delay
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             Self.permissionRequestInProgress = false
-        }
-    }
-    
-    // Check permission and re-register hotkeys when app becomes active
-    func checkAndUpdatePermission() {
-        let hadPermission = isRegistered
-        let hasPermission = hasAccessibilityPermission()
-        
-        if !hadPermission && hasPermission {
-            // Permission was just granted, re-register all hotkeys
-            print("Accessibility permission granted - registering hotkeys")
-            DispatchQueue.main.async {
-                NotificationCenter.default.post(name: NSNotification.Name("AccessibilityPermissionGranted"), object: nil)
-            }
         }
     }
     
     func registerHotkey(_ keyCombo: String) -> Bool {
         print("Attempting to register hotkey: \(keyCombo)")
         
-        // Check if we have permission first
         guard hasAccessibilityPermission() else {
             print("Hotkey registration failed: No accessibility permission")
             isRegistered = false
@@ -262,9 +278,10 @@ class GlobalHotkeyManager: ObservableObject {
             print("Hotkey registration failed: \(keyCombo) is a reserved shortcut")
             return false
         }
+        
         if hotkeyRefs[keyCombo] != nil {
-            print("Hotkey registration failed: \(keyCombo) is already registered")
-            return false
+            print("Hotkey already registered: \(keyCombo)")
+            return true
         }
         
         var hotkeyRef: EventHotKeyRef?
@@ -326,10 +343,6 @@ class GlobalHotkeyManager: ObservableObject {
         if keyChar.range(of: "⌃") != nil { modifiers |= UInt32(controlKey) }
         if keyChar.range(of: "⌥") != nil { modifiers |= UInt32(optionKey) }
         if keyChar.range(of: "⇪") != nil { modifiers |= 0x10000 }
-        if keyChar.range(of: "🌐") != nil || keyChar.range(of: "fn") != nil {
-            print("Fn key is not supported for hotkey registration")
-            return nil
-        }
         
         let cleanKey = baseKey.uppercased()
         guard let keyCode = charToKeyCode(cleanKey) else {
@@ -366,6 +379,7 @@ class GlobalHotkeyManager: ObservableObject {
     }
 
     deinit {
+        permissionCheckTimer?.invalidate()
         if let handler = eventHandler {
             RemoveEventHandler(handler)
         }
@@ -537,6 +551,8 @@ struct ThemeToggle: View {
 
 // MARK: - ViewModel
 class ClipboardViewModel: ObservableObject {
+    static let shared = ClipboardViewModel()
+    
     @Published var items: [ClipboardItem] = []
     @Published var theme: Theme = .light {
         didSet {
@@ -560,6 +576,12 @@ class ClipboardViewModel: ObservableObject {
         }
     }
     @Published var showReturnToTop = false
+    @Published var useMenuBarMode: Bool = false {
+        didSet {
+            saveSettings()
+            updateAppMode()
+        }
+    }
     
     private var changeCount = NSPasteboard.general.changeCount
     private let historyKey = "ClipboardHistory"
@@ -577,9 +599,9 @@ class ClipboardViewModel: ObservableObject {
             self?.pollClipboard()
         }
         
-        // Check and register hotkeys after a short delay
+        // Delayed hotkey registration
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.updateGlobalHotkeys()
+            self.checkAndRegisterHotkeys()
         }
         
         NotificationCenter.default.addObserver(
@@ -590,29 +612,39 @@ class ClipboardViewModel: ObservableObject {
             self?.clearSelectionStates()
         }
         
-        // Listen for permission granted notification
+        // Listen for permission granted
         NotificationCenter.default.addObserver(
             forName: NSNotification.Name("AccessibilityPermissionGranted"),
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.updateGlobalHotkeys()
-        }
-        
-        // Check permission status periodically when app is running
-        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.checkPermissionStatus()
+            self?.onPermissionGranted()
         }
     }
     
-    private func checkPermissionStatus() {
-        // Only check if we have shortcuts but they're not registered
-        if !keyboardShortcuts.isEmpty && !GlobalHotkeyManager.shared.isRegistered {
+    private func updateAppMode() {
+        if useMenuBarMode {
+            MenuBarManager.shared.createMenuBarIcon()
+            toast("Menu Bar mode activated")
+        } else {
+            MenuBarManager.shared.removeMenuBarIcon()
+        }
+    }
+    
+    private func checkAndRegisterHotkeys() {
+        if !keyboardShortcuts.isEmpty {
             if GlobalHotkeyManager.shared.hasAccessibilityPermission() {
-                print("Permission detected - registering hotkeys")
                 updateGlobalHotkeys()
+            } else {
+                print("No accessibility permission - hotkeys saved but not active")
             }
         }
+    }
+    
+    private func onPermissionGranted() {
+        print("Permission granted notification received")
+        updateGlobalHotkeys()
+        toast("Accessibility permission granted - hotkeys activated")
     }
     
     private func clearSelectionStates() {
@@ -631,18 +663,15 @@ class ClipboardViewModel: ObservableObject {
     }
     
     var filteredItems: [ClipboardItem] {
-        // SIMPLE LOGIC - NO COMPLEX SORTING
         let searchLowercased = searchText.lowercased()
         
         if searchText.isEmpty {
-            // Return ALL items, favorites first
             let favorites = items.filter { $0.isFavorite }.sorted { (a, b) in
                 (a.favoritePosition ?? 0) < (b.favoritePosition ?? 0)
             }
             let nonFavorites = items.filter { !$0.isFavorite }.sorted { $0.timestamp > $1.timestamp }
             return favorites + nonFavorites
         } else {
-            // Filter by search
             return items.filter { $0.lowercaseContent.contains(searchLowercased) }
         }
     }
@@ -662,25 +691,21 @@ class ClipboardViewModel: ObservableObject {
     
     func handleNewClipboardContent(content: String = "", imageData: Data? = nil) {
         if !content.isEmpty {
-            // Check if this content already exists
             if items.contains(where: { $0.content == content }) {
-                return // Don't add duplicates
+                return
             }
             insert(content: content, showToast: false)
         } else if imageData != nil {
-            // Check if this image already exists
             if items.contains(where: { $0.isImage && $0.imageData == imageData }) {
-                return // Don't add duplicates
+                return
             }
             insert(imageData: imageData, showToast: false)
         }
     }
     
     func insert(content: String = "", imageData: Data? = nil, isFavorite: Bool = false, showToast: Bool = true) {
-        // DEAD SIMPLE INSERT LOGIC
         let newItem = ClipboardItem(content: content, imageData: imageData, isFavorite: isFavorite)
         
-        // Just add to beginning of array - simple!
         items.insert(newItem, at: 0)
         
         if showToast {
@@ -689,7 +714,6 @@ class ClipboardViewModel: ObservableObject {
         
         saveHistory()
         
-        // Force UI update
         DispatchQueue.main.async {
             self.objectWillChange.send()
         }
@@ -707,7 +731,6 @@ class ClipboardViewModel: ObservableObject {
         selectedItem = item
         toast("Copied")
         
-        // Move copied item to top (under favorites) if it's not a favorite
         if !item.isFavorite {
             moveItemToTop(item)
         }
@@ -729,33 +752,26 @@ class ClipboardViewModel: ObservableObject {
         selectedItem = item
         toast("Copied")
         
-        // Move copied item to top (under favorites) if it's not a favorite
         if !item.isFavorite {
             moveItemToTop(item)
         }
-        
-        // Don't close the app when copying from preview
     }
     
     private func moveItemToTop(_ item: ClipboardItem) {
-        // Find and remove the item from its current position
         if let currentIndex = items.firstIndex(where: { $0.id == item.id }) {
             let itemToMove = items[currentIndex]
             items.remove(at: currentIndex)
             
-            // Insert after all favorites (at the top of non-favorites)
             let favoriteCount = items.filter { $0.isFavorite }.count
             var updatedItem = itemToMove
-            updatedItem.timestamp = Date() // Update timestamp to mark as recently used
+            updatedItem.timestamp = Date()
             items.insert(updatedItem, at: favoriteCount)
             
-            // Save the updated order
             saveHistory()
         }
     }
     
     func showPreviewFor(_ item: ClipboardItem) {
-        // Use async to prevent UI blocking
         DispatchQueue.main.async {
             self.previewItem = item
             self.showPreview = true
@@ -802,7 +818,6 @@ class ClipboardViewModel: ObservableObject {
                 items.insert(updatedItem, at: 0)
             } else {
                 updatedItem.favoritePosition = nil
-                // Insert after all favorites
                 let favoriteCount = items.filter { $0.isFavorite }.count
                 items.insert(updatedItem, at: favoriteCount)
             }
@@ -858,7 +873,6 @@ class ClipboardViewModel: ObservableObject {
     func addShortcut(key: String, modifier: String) {
         print("Adding shortcut - key: '\(key)', modifier: '\(modifier)'")
         
-        // Require at least one modifier for Carbon RegisterEventHotKey
         if modifier == "None" {
             print("No modifier selected - Carbon requires at least one modifier")
             toast("Please select a modifier key (⌘, ⌥, ⌃, or ⇧)")
@@ -888,37 +902,34 @@ class ClipboardViewModel: ObservableObject {
             return
         }
         
-        // First save the shortcut to our list
+        // Save the shortcut first
         keyboardShortcuts.append(KeyboardShortcut(combo: fullCombo))
         saveSettings()
         
-        // Check permission and try to register
+        // Try to register it
         if !GlobalHotkeyManager.shared.hasAccessibilityPermission() {
             print("No accessibility permission - requesting...")
-            toast("Please grant accessibility permission in System Settings")
-            
-            // Request permission
+            toast("Grant accessibility permission to activate shortcuts")
             GlobalHotkeyManager.shared.requestAccessibilityPermission()
             
-            // Check periodically if permission was granted
+            // Start checking for permission
             checkPermissionAndRegister(fullCombo: fullCombo, attempts: 0)
         } else {
-            // We have permission, register immediately
             attemptHotkeyRegistration(fullCombo: fullCombo)
         }
     }
     
     private func checkPermissionAndRegister(fullCombo: String, attempts: Int) {
-        guard attempts < 60 else { // Check for 60 seconds max
-            toast("Permission check timeout - please restart the app after granting permission")
+        guard attempts < 60 else {
+            toast("Permission check timeout - restart app after granting permission")
             return
         }
         
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             if GlobalHotkeyManager.shared.hasAccessibilityPermission() {
                 print("Permission granted! Registering all hotkeys...")
-                self.updateGlobalHotkeys() // Register all saved hotkeys
-                self.toast("Shortcut registered: \(fullCombo)")
+                self.updateGlobalHotkeys()
+                self.toast("Shortcuts activated!")
             } else {
                 self.checkPermissionAndRegister(fullCombo: fullCombo, attempts: attempts + 1)
             }
@@ -931,7 +942,7 @@ class ClipboardViewModel: ObservableObject {
             toast("Shortcut registered: \(fullCombo)")
         } else {
             print("Failed to register shortcut: \(fullCombo)")
-            toast("Failed to register shortcut - try a different combination")
+            toast("Failed to register - try a different combination")
         }
     }
     
@@ -946,17 +957,23 @@ class ClipboardViewModel: ObservableObject {
         print("Updating all global hotkeys")
         GlobalHotkeyManager.shared.unregisterAllHotkeys()
         
-        // Only register if we already have permission (no prompting here)
         guard GlobalHotkeyManager.shared.hasAccessibilityPermission() else {
             print("Cannot register hotkeys: No accessibility permission")
             return
         }
         
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            for shortcut in self.keyboardShortcuts {
-                let success = GlobalHotkeyManager.shared.registerHotkey(shortcut.combo)
-                print("Re-registering shortcut \(shortcut.combo): \(success ? "success" : "failed")")
+        var successCount = 0
+        for shortcut in keyboardShortcuts {
+            if GlobalHotkeyManager.shared.registerHotkey(shortcut.combo) {
+                successCount += 1
+                print("Registered shortcut: \(shortcut.combo)")
+            } else {
+                print("Failed to register: \(shortcut.combo)")
             }
+        }
+        
+        if successCount > 0 {
+            toast("\(successCount) shortcut(s) activated")
         }
     }
     
@@ -1056,7 +1073,7 @@ class ClipboardViewModel: ObservableObject {
     func toast(_ text: String) {
         toastText = text
         showToast = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             self.showToast = false
         }
     }
@@ -1081,6 +1098,7 @@ class ClipboardViewModel: ObservableObject {
         if let themeData = try? JSONEncoder().encode(theme) {
             UserDefaults.standard.set(themeData, forKey: "AppTheme")
         }
+        UserDefaults.standard.set(useMenuBarMode, forKey: "UseMenuBarMode")
     }
     
     private func loadSettings() {
@@ -1093,15 +1111,20 @@ class ClipboardViewModel: ObservableObject {
            let savedTheme = try? JSONDecoder().decode(Theme.self, from: themeData) {
             theme = savedTheme
         }
+        
+        useMenuBarMode = UserDefaults.standard.bool(forKey: "UseMenuBarMode")
+        if useMenuBarMode {
+            updateAppMode()
+        }
     }
 }
 
 // MARK: - Main View
 @available(macOS 12.0, *)
 struct ClipboardAppView: View {
-    @StateObject var vm = ClipboardViewModel()
+    @StateObject var vm = ClipboardViewModel.shared
     @StateObject private var hotkeyManager = GlobalHotkeyManager.shared
-    @StateObject private var menuBarManager = MenuBarManager()
+    @StateObject private var menuBarManager = MenuBarManager.shared
     @State private var newShortcut: String = ""
     @State private var selectedHotkey: String = "Command (⌘)"
     @State private var manualText: String = ""
@@ -1139,21 +1162,17 @@ struct ClipboardAppView: View {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 
-                // Check permission and register hotkeys after app appears
+                // Check and register hotkeys if permission exists
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    if !vm.keyboardShortcuts.isEmpty {
-                        if GlobalHotkeyManager.shared.hasAccessibilityPermission() {
-                            vm.updateGlobalHotkeys()
-                        } else {
-                            print("No accessibility permission - hotkeys won't work until permission is granted")
-                        }
+                    if !vm.keyboardShortcuts.isEmpty && hotkeyManager.hasAccessibilityPermission() {
+                        vm.updateGlobalHotkeys()
                     }
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                // Check permission when app becomes active
-                if !vm.keyboardShortcuts.isEmpty {
-                    GlobalHotkeyManager.shared.checkAndUpdatePermission()
+                // Re-check permission when app becomes active
+                if !vm.keyboardShortcuts.isEmpty && hotkeyManager.hasAccessibilityPermission() && !hotkeyManager.isRegistered {
+                    vm.updateGlobalHotkeys()
                 }
             }
             
@@ -1203,7 +1222,6 @@ struct ClipboardAppView: View {
             
             Spacer()
             
-            // Return to Top Button with app icon styling (smaller)
             Button(action: {
                 NotificationCenter.default.post(name: NSNotification.Name("ScrollToTop"), object: nil)
             }) {
@@ -1265,7 +1283,6 @@ struct ClipboardAppView: View {
                             .padding(.top, 60)
                             .id("topAnchor")
                         } else {
-                            // Top anchor for scrolling
                             Color.clear
                                 .frame(height: 1)
                                 .id("topAnchor")
@@ -1344,7 +1361,6 @@ struct ClipboardAppView: View {
     
     func textContent(item: ClipboardItem) -> some View {
         HStack {
-            // Optimize long text display in list by truncating for display only
             let displayText = item.content.count > 500 ?
                 String(item.content.prefix(500)) + "..." :
                 item.content
@@ -1448,7 +1464,6 @@ struct ClipboardAppView: View {
     
     var settingsPanel: some View {
         VStack(spacing: 0) {
-            // Sticky Header
             VStack(spacing: 16) {
                 HStack {
                     Text("Settings").font(.headline)
@@ -1482,9 +1497,45 @@ struct ClipboardAppView: View {
             
             Divider()
             
-            // Scrollable Content
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
+                    // Access Mode Section
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Access Mode")
+                            .font(.subheadline)
+                            .fontWeight(.bold)
+                        
+                        VStack(alignment: .leading, spacing: 8) {
+                            // Menu Bar Mode
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundColor(.green)
+                                            .font(.caption)
+                                        Text("Menu Bar Mode")
+                                            .font(.caption)
+                                            .fontWeight(.medium)
+                                        Text("(No permission needed)")
+                                            .font(.caption2)
+                                            .foregroundColor(.green)
+                                    }
+                                    Text("Click menu bar icon to open")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                Toggle("", isOn: $vm.useMenuBarMode)
+                                    .labelsHidden()
+                            }
+                            .padding(8)
+                            .background(Color.green.opacity(0.1))
+                            .cornerRadius(6)
+                        }
+                    }
+                    
+                    Divider()
+                    
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Add Manual Entry")
                             .font(.subheadline)
@@ -1537,15 +1588,14 @@ struct ClipboardAppView: View {
                             }
                         }
                         
-                        // Permission status and manual check button
-                        if !hotkeyManager.hasAccessibilityPermission() {
+                        if !hotkeyManager.permissionGranted {
                             HStack {
                                 Image(systemName: "exclamationmark.triangle.fill")
                                     .foregroundColor(.orange)
                                     .font(.caption)
                                 
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text("Accessibility permission required for global shortcuts")
+                                    Text("Accessibility permission required")
                                         .font(.caption)
                                         .foregroundColor(.orange)
                                     
@@ -1559,7 +1609,7 @@ struct ClipboardAppView: View {
                                         Button("Check Permission") {
                                             if hotkeyManager.hasAccessibilityPermission() {
                                                 vm.updateGlobalHotkeys()
-                                                vm.toast("Permission granted - hotkeys activated")
+                                                vm.toast("Permission granted!")
                                             } else {
                                                 vm.toast("Permission not granted yet")
                                             }
@@ -1573,13 +1623,12 @@ struct ClipboardAppView: View {
                             .background(Color.orange.opacity(0.1))
                             .cornerRadius(8)
                         } else if !hotkeyManager.isRegistered && !vm.keyboardShortcuts.isEmpty {
-                            // Permission granted but hotkeys not registered
                             HStack {
                                 Text("Permission granted but hotkeys not active")
                                     .font(.caption)
                                     .foregroundColor(.orange)
                                 
-                                Button("Activate Hotkeys") {
+                                Button("Activate") {
                                     vm.updateGlobalHotkeys()
                                 }
                                 .font(.caption)
@@ -1710,7 +1759,7 @@ struct ClipboardAppView: View {
                         }
                     }
                     
-                    Text("Version v1.5.6")
+                    Text("Version v1.5.7")
                         .font(.caption)
                         .foregroundColor(.gray)
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -1792,10 +1841,8 @@ struct ClipboardAppView: View {
                             }
                         }
                         
-                        // Optimized text display with chunking for very long content
                         ScrollView {
                             if item.content.count > 50000 {
-                                // For very long text, use chunked loading
                                 LazyVStack(alignment: .leading, spacing: 4) {
                                     ForEach(0..<min(50, item.content.count / 1000), id: \.self) { chunkIndex in
                                         let startIndex = chunkIndex * 1000
@@ -1812,7 +1859,6 @@ struct ClipboardAppView: View {
                                 .background(Color(NSColor.controlBackgroundColor))
                                 .cornerRadius(6)
                             } else {
-                                // For normal text, use regular display
                                 Text(item.content)
                                     .font(.system(size: 13))
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1855,7 +1901,7 @@ struct ClipboardAppView: View {
 @available(macOS 12.0, *)
 struct CopyMacApp: App {
     @StateObject private var hotkeyManager = GlobalHotkeyManager.shared
-    @StateObject private var menuBarManager = MenuBarManager()
+    @StateObject private var menuBarManager = MenuBarManager.shared
     
     var body: some Scene {
         WindowGroup {
@@ -1881,4 +1927,5 @@ struct CopyMacApp: App {
 }
 
 // Manual entry point - only use if @main doesn't work
+CopyMacApp.main()
 CopyMacApp.main()
