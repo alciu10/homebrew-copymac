@@ -1,57 +1,4 @@
-if !hotkeyManager.permissionGranted {
-                            HStack {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundColor(.orange)
-                                    .font(.caption)
-                                
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Accessibility permission required for shortcuts")
-                                        .font(.caption)
-                                        .foregroundColor(.orange)
-                                    
-                                    HStack {
-                                        Button("Open System Settings") {
-                                            hotkeyManager.openAccessibilitySettings()
-                                        }
-                                        .font(.caption)
-                                        .buttonStyle(.bordered)
-                                        
-                                        Button("Refresh Status") {
-                                            // Force check permission
-                                            hotkeyManager.forcePermissionCheck()
-                                            
-                                            if hotkeyManager.hasAccessibilityPermission() {
-                                                vm.updateGlobalHotkeys()
-                                                vm.toast("✅ Permission granted!")
-                                            } else {
-                                                vm.toast("❌ Permission not granted yet")
-                                            }
-                                        }
-                                        .font(.caption)
-                                        .buttonStyle(.borderedProminent)
-                                    }
-                                    
-                                    Text("After granting permission, click 'Refresh Status'")
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                            .padding(8)
-                            .background(Color.orange.opacity(0.1))
-                            .cornerRadius(8)
-                        } else if !hotkeyManager.isRegistered && !vm.keyboardShortcuts.isEmpty {
-                            HStack {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundColor(.green)
-                                    .font(.caption)
-                                
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Permission granted but hotkeys not active")
-                                        .font(.caption)
-                                        .foregroundColor(.orange)
-                                    
-                                    Button("Activate Shortcuts") {
-                                        vm.updateGlobalimport SwiftUI
+import SwiftUI
 import AppKit
 import Carbon
 import Foundation
@@ -147,7 +94,7 @@ class MenuBarManager: ObservableObject {
     }
 }
 
-// MARK: - Global Hotkey Manager (Fixed Permission Handling)
+// MARK: - Global Hotkey Manager (Enhanced Permission Handling)
 class GlobalHotkeyManager: ObservableObject {
     static let shared = GlobalHotkeyManager()
     private var hotkeyRefs: [String: EventHotKeyRef] = [:]
@@ -157,13 +104,14 @@ class GlobalHotkeyManager: ObservableObject {
     private var eventHandler: EventHandlerRef?
     private static var permissionRequestInProgress = false
     private var permissionCheckTimer: Timer?
-    private var lastPermissionCheck: Date = Date()
-
+    
     private init() {
         setupEventHandler()
         startPermissionMonitoring()
+        // Load saved permission state
+        loadPermissionState()
     }
-
+    
     private func setupEventHandler() {
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
@@ -188,7 +136,7 @@ class GlobalHotkeyManager: ObservableObject {
             print("Failed to install event handler: \(result)")
         }
     }
-
+    
     private static func staticEventHandler(nextHandler: EventHandlerCallRef, event: EventRef, userData: UnsafeMutableRawPointer) -> OSStatus {
         let manager = Unmanaged<GlobalHotkeyManager>.fromOpaque(userData).takeUnretainedValue()
         var hotKeyID = EventHotKeyID()
@@ -215,57 +163,46 @@ class GlobalHotkeyManager: ObservableObject {
     }
     
     private func startPermissionMonitoring() {
-        // Initial check
-        updatePermissionStatus()
-        
-        // Check permission status every second for better responsiveness
+        permissionCheckTimer?.invalidate()
         permissionCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.updatePermissionStatus()
         }
-    }
-    
-    func forcePermissionCheck() {
-        print("Force checking permission...")
+        RunLoop.current.add(permissionCheckTimer!, forMode: .common)
         updatePermissionStatus()
     }
     
     private func updatePermissionStatus() {
         let wasGranted = permissionGranted
-        let currentStatus = AXIsProcessTrusted()
+        permissionGranted = AXIsProcessTrusted()
         
-        // Always update the status
-        DispatchQueue.main.async {
-            self.permissionGranted = currentStatus
-        }
-        
-        if !wasGranted && currentStatus {
-            // Permission was just granted
-            print("✅ Accessibility permission GRANTED!")
-            lastPermissionCheck = Date()
-            
+        if !wasGranted && permissionGranted {
+            print("Accessibility permission granted!")
+            savePermissionState()
             DispatchQueue.main.async {
-                // Notify that permission was granted
                 NotificationCenter.default.post(name: NSNotification.Name("AccessibilityPermissionGranted"), object: nil)
-                
-                // Try to register any pending hotkeys
+                // Re-register all hotkeys when permission is granted
                 ClipboardViewModel.shared.updateGlobalHotkeys()
             }
-        } else if wasGranted && !currentStatus {
-            // Permission was revoked
-            print("❌ Accessibility permission REVOKED")
+        } else if wasGranted && !permissionGranted {
+            print("Accessibility permission revoked")
+            savePermissionState()
             unregisterAllHotkeys()
-            DispatchQueue.main.async {
-                NotificationCenter.default.post(name: NSNotification.Name("AccessibilityPermissionRevoked"), object: nil)
-            }
-        }
-        
-        // Log status periodically
-        if Date().timeIntervalSince(lastPermissionCheck) > 5 {
-            print("Permission status: \(currentStatus ? "GRANTED" : "NOT GRANTED")")
-            lastPermissionCheck = Date()
         }
     }
-
+    
+    private func savePermissionState() {
+        UserDefaults.standard.set(permissionGranted, forKey: "AccessibilityPermissionGranted")
+    }
+    
+    private func loadPermissionState() {
+        permissionGranted = UserDefaults.standard.bool(forKey: "AccessibilityPermissionGranted")
+        if permissionGranted {
+            // Verify actual permission status
+            permissionGranted = AXIsProcessTrusted()
+            savePermissionState()
+        }
+    }
+    
     func toggleAppVisibility() {
         DispatchQueue.main.async {
             if self.isAppVisible {
@@ -275,7 +212,7 @@ class GlobalHotkeyManager: ObservableObject {
             }
         }
     }
-
+    
     func showApp() {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -329,71 +266,39 @@ class GlobalHotkeyManager: ObservableObject {
         
         Self.permissionRequestInProgress = true
         
-        print("🔐 Requesting accessibility permission...")
-        
         let options: [String: Any] = [
             kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
         ]
+        _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
         
-        let trusted = AXIsProcessTrustedWithOptions(options as CFDictionary)
-        print("Initial trust status: \(trusted)")
-        
-        // Start aggressive checking after request
-        var checkCount = 0
-        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
-            checkCount += 1
-            let isNowTrusted = AXIsProcessTrusted()
-            print("Permission check #\(checkCount): \(isNowTrusted ? "GRANTED" : "NOT GRANTED")")
-            
-            if isNowTrusted {
-                print("✅ Permission detected as GRANTED!")
-                timer.invalidate()
-                Self.permissionRequestInProgress = false
-                
-                DispatchQueue.main.async {
-                    self.updatePermissionStatus()
-                    NotificationCenter.default.post(name: NSNotification.Name("AccessibilityPermissionGranted"), object: nil)
-                }
-            } else if checkCount > 120 { // 60 seconds timeout
-                print("⏱ Permission check timeout")
-                timer.invalidate()
-                Self.permissionRequestInProgress = false
-            }
-        }
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             Self.permissionRequestInProgress = false
         }
     }
     
     func registerHotkey(_ keyCombo: String) -> Bool {
-        print("📝 Attempting to register hotkey: \(keyCombo)")
+        print("Attempting to register hotkey: \(keyCombo)")
         
-        // Force check permission status
-        let hasPermission = AXIsProcessTrusted()
-        print("Current permission status: \(hasPermission ? "GRANTED" : "NOT GRANTED")")
-        
-        guard hasPermission else {
-            print("❌ Hotkey registration failed: No accessibility permission")
+        guard hasAccessibilityPermission() else {
+            print("Hotkey registration failed: No accessibility permission")
             isRegistered = false
             return false
         }
         
         guard let (keyCode, modifiers) = parseKeyCombo(keyCombo) else {
-            print("❌ Hotkey registration failed: Invalid key combo \(keyCombo)")
+            print("Hotkey registration failed: Invalid key combo \(keyCombo)")
             return false
         }
         
         let reservedShortcuts = ["⌘V", "⌘C", "⌘X", "⌘Z"]
         if reservedShortcuts.contains(where: { $0 == keyCombo }) {
-            print("❌ Hotkey registration failed: \(keyCombo) is a reserved shortcut")
+            print("Hotkey registration failed: \(keyCombo) is a reserved shortcut")
             return false
         }
         
-        // Unregister if already exists
         if hotkeyRefs[keyCombo] != nil {
-            print("⚠️ Hotkey already registered, re-registering: \(keyCombo)")
-            unregisterHotkey(keyCombo)
+            print("Hotkey already registered: \(keyCombo)")
+            return true
         }
         
         var hotkeyRef: EventHotKeyRef?
@@ -410,14 +315,12 @@ class GlobalHotkeyManager: ObservableObject {
         
         if status == noErr, let ref = hotkeyRef {
             hotkeyRefs[keyCombo] = ref
-            print("✅ Hotkey registered successfully: \(keyCombo)")
-            DispatchQueue.main.async {
-                self.isRegistered = !self.hotkeyRefs.isEmpty
-            }
+            print("Hotkey registered successfully: \(keyCombo)")
+            isRegistered = !hotkeyRefs.isEmpty
             return true
         }
         
-        print("❌ Hotkey registration failed with status: \(status)")
+        print("Hotkey registration failed with status: \(status)")
         return false
     }
     
@@ -425,22 +328,16 @@ class GlobalHotkeyManager: ObservableObject {
         if let ref = hotkeyRefs[keyCombo] {
             UnregisterEventHotKey(ref)
             hotkeyRefs.removeValue(forKey: keyCombo)
-            print("🗑 Unregistered hotkey: \(keyCombo)")
         }
-        DispatchQueue.main.async {
-            self.isRegistered = !self.hotkeyRefs.isEmpty
-        }
+        isRegistered = !hotkeyRefs.isEmpty
     }
     
     func unregisterAllHotkeys() {
-        for (combo, ref) in hotkeyRefs {
+        for (_, ref) in hotkeyRefs {
             UnregisterEventHotKey(ref)
-            print("🗑 Unregistered hotkey: \(combo)")
         }
         hotkeyRefs.removeAll()
-        DispatchQueue.main.async {
-            self.isRegistered = false
-        }
+        isRegistered = false
     }
     
     func parseKeyCombo(_ combo: String) -> (keyCode: CGKeyCode, modifiers: UInt32)? {
@@ -497,12 +394,13 @@ class GlobalHotkeyManager: ObservableObject {
             NSWorkspace.shared.open(url)
         }
     }
-
+    
     deinit {
         permissionCheckTimer?.invalidate()
         if let handler = eventHandler {
             RemoveEventHandler(handler)
         }
+        unregisterAllHotkeys()
     }
 }
 
@@ -991,7 +889,7 @@ class ClipboardViewModel: ObservableObject {
     }
     
     func addShortcut(key: String, modifier: String) {
-        print("➕ Adding shortcut - key: '\(key)', modifier: '\(modifier)'")
+        print("Adding shortcut - key: '\(key)', modifier: '\(modifier)'")
         
         if modifier == "None" {
             print("No modifier selected - Carbon requires at least one modifier")
@@ -1022,96 +920,88 @@ class ClipboardViewModel: ObservableObject {
             return
         }
         
-        // Save the shortcut first (persist even without permission)
+        // Save the shortcut first
         keyboardShortcuts.append(KeyboardShortcut(combo: fullCombo))
         saveSettings()
-        print("💾 Shortcut saved to settings: \(fullCombo)")
         
-        // Check current permission status
-        let hasPermission = GlobalHotkeyManager.shared.hasAccessibilityPermission()
-        print("Current permission status: \(hasPermission)")
-        
-        if !hasPermission {
-            print("🔐 No permission - requesting...")
-            toast("Please grant accessibility permission in System Settings")
-            
-            // Request permission
+        // Try to register it
+        if !GlobalHotkeyManager.shared.hasAccessibilityPermission() {
+            print("No accessibility permission - requesting...")
+            toast("Grant accessibility permission to activate shortcuts")
             GlobalHotkeyManager.shared.requestAccessibilityPermission()
             
-            // Start monitoring for permission grant
-            var attemptCount = 0
-            Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
-                attemptCount += 1
-                
-                // Force check permission
-                GlobalHotkeyManager.shared.forcePermissionCheck()
-                
-                if GlobalHotkeyManager.shared.hasAccessibilityPermission() {
-                    print("✅ Permission granted after \(attemptCount) attempts!")
-                    timer.invalidate()
-                    
-                    DispatchQueue.main.async {
-                        // Register all saved hotkeys
-                        self.updateGlobalHotkeys()
-                        self.toast("Permission granted! Shortcuts activated")
-                    }
-                } else if attemptCount > 60 {
-                    print("⏱ Permission check timeout after 60 attempts")
-                    timer.invalidate()
-                    
-                    DispatchQueue.main.async {
-                        self.toast("Permission timeout - please restart app after granting permission")
-                    }
-                } else if attemptCount % 10 == 0 {
-                    print("Still waiting for permission... (attempt \(attemptCount))")
-                }
-            }
+            // Start checking for permission
+            checkPermissionAndRegister(fullCombo: fullCombo, attempts: 0)
         } else {
-            // We have permission, register immediately
-            print("✅ Permission already granted - registering hotkey")
             attemptHotkeyRegistration(fullCombo: fullCombo)
         }
     }
     
-    func updateGlobalHotkeys() {
-        print("🔄 Updating all global hotkeys...")
-        
-        // First unregister all
-        GlobalHotkeyManager.shared.unregisterAllHotkeys()
-        
-        // Force permission check
-        GlobalHotkeyManager.shared.forcePermissionCheck()
-        
-        // Check permission
-        guard GlobalHotkeyManager.shared.hasAccessibilityPermission() else {
-            print("❌ Cannot register hotkeys: No accessibility permission")
-            toast("Accessibility permission required for shortcuts")
+    private func checkPermissionAndRegister(fullCombo: String, attempts: Int) {
+        guard attempts < 30 else {
+            toast("Permission check timeout - restart app after granting permission")
             return
         }
         
-        print("✅ Permission confirmed - registering \(keyboardShortcuts.count) shortcuts")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            if GlobalHotkeyManager.shared.hasAccessibilityPermission() {
+                print("Permission granted! Registering all hotkeys...")
+                self.updateGlobalHotkeys()
+                self.toast("Shortcuts activated!")
+            } else {
+                self.checkPermissionAndRegister(fullCombo: fullCombo, attempts: attempts + 1)
+            }
+        }
+    }
+    
+    private func attemptHotkeyRegistration(fullCombo: String) {
+        if GlobalHotkeyManager.shared.registerHotkey(fullCombo) {
+            print("Shortcut registered successfully: \(fullCombo)")
+            toast("Shortcut registered: \(fullCombo)")
+        } else {
+            print("Failed to register shortcut: \(fullCombo)")
+            toast("Failed to register - try a different combination")
+            // Remove the failed shortcut from storage
+            keyboardShortcuts.removeAll { $0.combo == fullCombo }
+            saveSettings()
+        }
+    }
+    
+    func removeShortcut(_ shortcut: String) {
+        keyboardShortcuts.removeAll { $0.combo == shortcut }
+        GlobalHotkeyManager.shared.unregisterHotkey(shortcut)
+        saveSettings()
+        toast("Shortcut removed")
+    }
+    
+    func updateGlobalHotkeys() {
+        print("Updating all global hotkeys")
+        GlobalHotkeyManager.shared.unregisterAllHotkeys()
+        
+        guard GlobalHotkeyManager.shared.hasAccessibilityPermission() else {
+            print("Cannot register hotkeys: No accessibility permission")
+            return
+        }
         
         var successCount = 0
-        var failedShortcuts: [String] = []
-        
         for shortcut in keyboardShortcuts {
             if GlobalHotkeyManager.shared.registerHotkey(shortcut.combo) {
                 successCount += 1
-                print("✅ Registered: \(shortcut.combo)")
+                print("Registered shortcut: \(shortcut.combo)")
             } else {
-                failedShortcuts.append(shortcut.combo)
-                print("❌ Failed to register: \(shortcut.combo)")
+                print("Failed to register: \(shortcut.combo)")
+                // Remove failed shortcut
+                keyboardShortcuts.removeAll { $0.combo == shortcut.combo }
             }
         }
         
-        if successCount > 0 {
-            toast("✅ \(successCount) shortcut(s) activated")
-        } else if !keyboardShortcuts.isEmpty {
-            toast("❌ Failed to activate shortcuts")
-        }
+        // Save updated shortcuts
+        saveSettings()
         
-        if !failedShortcuts.isEmpty {
-            print("Failed shortcuts: \(failedShortcuts.joined(separator: ", "))")
+        if successCount > 0 {
+            toast("\(successCount) shortcut(s) activated")
+        } else if !keyboardShortcuts.isEmpty {
+            toast("Failed to register some shortcuts")
         }
     }
     
@@ -1300,34 +1190,18 @@ struct ClipboardAppView: View {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 
-                // Force check permission status on app appear
+                // Check and register hotkeys if permission exists
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    print("📱 App appeared - checking permission status...")
-                    hotkeyManager.forcePermissionCheck()
-                    
-                    if !vm.keyboardShortcuts.isEmpty {
-                        if hotkeyManager.hasAccessibilityPermission() {
-                            print("✅ Permission detected on app appear")
-                            vm.updateGlobalHotkeys()
-                        } else {
-                            print("⚠️ No permission on app appear")
-                        }
+                    if !vm.keyboardShortcuts.isEmpty && hotkeyManager.hasAccessibilityPermission() {
+                        vm.updateGlobalHotkeys()
                     }
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                // Re-check permission every time app becomes active
-                print("🔄 App became active - checking permission...")
-                hotkeyManager.forcePermissionCheck()
-                
-                if !vm.keyboardShortcuts.isEmpty && hotkeyManager.permissionGranted && !hotkeyManager.isRegistered {
-                    print("📝 Re-registering hotkeys after app activation")
+                // Re-check permission when app becomes active
+                if !vm.keyboardShortcuts.isEmpty && hotkeyManager.hasAccessibilityPermission() && !hotkeyManager.isRegistered {
                     vm.updateGlobalHotkeys()
                 }
-            }
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.willBecomeActiveNotification)) { _ in
-                // Force permission check before becoming active
-                hotkeyManager.forcePermissionCheck()
             }
             
             if vm.showSettings { settingsPanel }
@@ -1749,35 +1623,29 @@ struct ClipboardAppView: View {
                                     .font(.caption)
                                 
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text("Accessibility permission required for shortcuts")
+                                    Text("Accessibility permission required")
                                         .font(.caption)
                                         .foregroundColor(.orange)
                                     
                                     HStack {
                                         Button("Open System Settings") {
                                             hotkeyManager.openAccessibilitySettings()
+                                            hotkeyManager.requestAccessibilityPermission()
                                         }
                                         .font(.caption)
                                         .buttonStyle(.bordered)
                                         
-                                        Button("Refresh Status") {
-                                            // Force check permission
-                                            hotkeyManager.forcePermissionCheck()
-                                            
+                                        Button("Check Permission") {
                                             if hotkeyManager.hasAccessibilityPermission() {
                                                 vm.updateGlobalHotkeys()
-                                                vm.toast("✅ Permission granted!")
+                                                vm.toast("Permission granted!")
                                             } else {
-                                                vm.toast("❌ Permission not granted yet")
+                                                vm.toast("Permission not granted yet")
                                             }
                                         }
                                         .font(.caption)
-                                        .buttonStyle(.borderedProminent)
+                                        .buttonStyle(.bordered)
                                     }
-                                    
-                                    Text("After granting permission, click 'Refresh Status'")
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
                                 }
                             }
                             .padding(8)
@@ -1785,37 +1653,18 @@ struct ClipboardAppView: View {
                             .cornerRadius(8)
                         } else if !hotkeyManager.isRegistered && !vm.keyboardShortcuts.isEmpty {
                             HStack {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundColor(.green)
+                                Text("Permission granted but hotkeys not active")
                                     .font(.caption)
+                                    .foregroundColor(.orange)
                                 
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Permission granted but hotkeys not active")
-                                        .font(.caption)
-                                        .foregroundColor(.orange)
-                                    
-                                    Button("Activate Shortcuts") {
-                                        vm.updateGlobalHotkeys()
-                                    }
-                                    .font(.caption)
-                                    .buttonStyle(.borderedProminent)
+                                Button("Activate") {
+                                    vm.updateGlobalHotkeys()
                                 }
+                                .font(.caption)
+                                .buttonStyle(.borderedProminent)
                             }
                             .padding(8)
-                            .background(Color.green.opacity(0.1))
-                            .cornerRadius(8)
-                        } else if hotkeyManager.permissionGranted && vm.keyboardShortcuts.isEmpty {
-                            HStack {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundColor(.green)
-                                    .font(.caption)
-                                
-                                Text("Permission granted - add shortcuts above")
-                                    .font(.caption)
-                                    .foregroundColor(.green)
-                            }
-                            .padding(8)
-                            .background(Color.green.opacity(0.1))
+                            .background(Color.orange.opacity(0.1))
                             .cornerRadius(8)
                         }
                         
@@ -1939,7 +1788,7 @@ struct ClipboardAppView: View {
                         }
                     }
                     
-                    Text("Version v1.5.8")
+                    Text("Version v1.5.9")
                         .font(.caption)
                         .foregroundColor(.gray)
                         .frame(maxWidth: .infinity, alignment: .center)
