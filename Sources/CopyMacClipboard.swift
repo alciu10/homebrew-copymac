@@ -94,34 +94,21 @@ class MenuBarManager: ObservableObject {
     }
 }
 
-// MARK: - Global Hotkey Manager (Stable IDs, no AX gate)
+// MARK: - Global Hotkey Manager
 class GlobalHotkeyManager: ObservableObject {
     static let shared = GlobalHotkeyManager()
-    
-    // Stable mapping
-    private var comboToRef: [String: EventHotKeyRef] = [:]
-    private var idToCombo: [UInt32: String] = [:]
-    
+    private var hotkeyRefs: [String: EventHotKeyRef] = [:]
     private var isAppVisible = false
     @Published var isRegistered = false
-    @Published var permissionGranted = false // informative only
+    @Published var permissionGranted = false
     private var eventHandler: EventHandlerRef?
+    private static var permissionRequestInProgress = false
     private var permissionCheckTimer: Timer?
     
     private init() {
         setupEventHandler()
-        // Accessibility permission is not required for RegisterEventHotKey,
-        // but we keep the status display for users who expect it.
         startPermissionMonitoring()
-    }
-    
-    // Stable 16-bit-ish ID from combo (djb2 then truncate)
-    private func stableID(for combo: String) -> UInt32 {
-        var hash: UInt32 = 5381
-        for u in combo.unicodeScalars {
-            hash = ((hash << 5) &+ hash) &+ UInt32(u.value)
-        }
-        return hash // RegisterEventHotKey accepts a UInt32 id; truncation handled implicitly
+        loadPermissionState()
     }
     
     private func setupEventHandler() {
@@ -132,10 +119,12 @@ class GlobalHotkeyManager: ObservableObject {
         let result = InstallEventHandler(
             GetApplicationEventTarget(),
             { (nextHandler, event, userData) -> OSStatus in
-                guard let event = event, let userData = userData else {
+                guard let nextHandler = nextHandler,
+                      let event = event,
+                      let userData = userData else {
                     return noErr
                 }
-                return GlobalHotkeyManager.staticEventHandler(event: event, userData: userData)
+                return GlobalHotkeyManager.staticEventHandler(nextHandler: nextHandler, event: event, userData: userData)
             },
             1,
             &eventType,
@@ -147,7 +136,7 @@ class GlobalHotkeyManager: ObservableObject {
         }
     }
     
-    private static func staticEventHandler(event: EventRef, userData: UnsafeMutableRawPointer) -> OSStatus {
+    private static func staticEventHandler(nextHandler: EventHandlerCallRef, event: EventRef, userData: UnsafeMutableRawPointer) -> OSStatus {
         let manager = Unmanaged<GlobalHotkeyManager>.fromOpaque(userData).takeUnretainedValue()
         var hotKeyID = EventHotKeyID()
         let size = MemoryLayout<EventHotKeyID>.size
@@ -161,12 +150,12 @@ class GlobalHotkeyManager: ObservableObject {
             &hotKeyID
         )
         if status == noErr {
-            let id = hotKeyID.id
-            if let combo = manager.idToCombo[id] {
-                print("Hotkey pressed: \(combo)")
-                manager.toggleAppVisibility()
-            } else {
-                print("Unknown hotkey id: \(id)")
+            for (combo, _) in manager.hotkeyRefs {
+                let refID = EventHotKeyID(signature: "CMAC".fourCharCode, id: UInt32(combo.hashValue & 0xFFFF))
+                if hotKeyID.id == refID.id {
+                    manager.toggleAppVisibility()
+                    break
+                }
             }
         }
         return noErr
@@ -174,18 +163,59 @@ class GlobalHotkeyManager: ObservableObject {
     
     private func startPermissionMonitoring() {
         permissionCheckTimer?.invalidate()
-        permissionCheckTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            let granted = AXIsProcessTrusted()
-            if granted != self.permissionGranted {
-                self.permissionGranted = granted
-                NotificationCenter.default.post(name: NSNotification.Name("AccessibilityPermissionChanged"), object: nil)
+        permissionCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.updatePermissionStatus()
+        }
+        RunLoop.current.add(permissionCheckTimer!, forMode: .common)
+        updatePermissionStatus()
+    }
+    
+    private func updatePermissionStatus() {
+        let wasGranted = permissionGranted
+        permissionGranted = AXIsProcessTrusted()
+        
+        if permissionGranted != wasGranted {
+            print("Permission state changed: \(permissionGranted ? "Granted" : "Revoked")")
+            do {
+                try savePermissionState()
+            } catch {
+                print("Failed to save permission state: \(error)")
+            }
+            DispatchQueue.main.async {
+                if self.permissionGranted {
+                    NotificationCenter.default.post(name: NSNotification.Name("AccessibilityPermissionGranted"), object: nil)
+                    ClipboardViewModel.shared.updateGlobalHotkeys()
+                } else {
+                    NotificationCenter.default.post(name: NSNotification.Name("AccessibilityPermissionRevoked"), object: nil)
+                    ClipboardViewModel.shared.updateGlobalHotkeys()
+                }
             }
         }
-        if let timer = permissionCheckTimer {
-            RunLoop.current.add(timer, forMode: .common)
+    }
+    
+    private func savePermissionState() throws {
+        let defaults = UserDefaults.standard
+        defaults.set(permissionGranted, forKey: "AccessibilityPermissionGranted")
+        // Verify write
+        if defaults.bool(forKey: "AccessibilityPermissionGranted") != permissionGranted {
+            throw NSError(domain: "CopyMac", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to save accessibility permission state"])
         }
-        permissionGranted = AXIsProcessTrusted()
+        print("Saved permission state: \(permissionGranted)")
+    }
+    
+    private func loadPermissionState() {
+        let defaults = UserDefaults.standard
+        permissionGranted = defaults.bool(forKey: "AccessibilityPermissionGranted")
+        let systemPermission = AXIsProcessTrusted()
+        if permissionGranted != systemPermission {
+            permissionGranted = systemPermission
+            do {
+                try savePermissionState()
+            } catch {
+                print("Failed to save permission state during load: \(error)")
+            }
+        }
+        print("Loaded permission state: \(permissionGranted)")
     }
     
     func toggleAppVisibility() {
@@ -201,20 +231,25 @@ class GlobalHotkeyManager: ObservableObject {
     func showApp() {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        
         for window in NSApp.windows {
             window.makeKeyAndOrderFront(nil)
         }
+        
         isAppVisible = true
     }
     
     func showAppAtMouse() {
         NSApp.setActivationPolicy(.regular)
+        
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
             NSApp.activate(ignoringOtherApps: true)
+            
             if let window = NSApp.windows.first {
                 window.positionWindowAtMouse(animated: true)
                 window.makeKeyAndOrderFront(nil)
             }
+            
             self.isAppVisible = true
         }
     }
@@ -225,36 +260,70 @@ class GlobalHotkeyManager: ObservableObject {
                 window.orderOut(nil)
             }
         }
+        
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             NSApp.setActivationPolicy(.accessory)
             self.isAppVisible = false
+            
             NotificationCenter.default.post(name: NSNotification.Name("AppWillHide"), object: nil)
         }
     }
     
-    // Register a single combo
+    func hasAccessibilityPermission() -> Bool {
+        let isTrusted = AXIsProcessTrusted()
+        print("Checked accessibility permission: \(isTrusted)")
+        return isTrusted
+    }
+    
+    func requestAccessibilityPermission() {
+        guard !Self.permissionRequestInProgress else {
+            print("Permission request already in progress")
+            return
+        }
+        
+        Self.permissionRequestInProgress = true
+        print("Requesting accessibility permission")
+        
+        let options: [String: Any] = [
+            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+        ]
+        _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
+        
+        // Immediate check after request
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.updatePermissionStatus()
+            Self.permissionRequestInProgress = false
+        }
+    }
+    
     func registerHotkey(_ keyCombo: String) -> Bool {
-        // Avoid duplicate registration
-        if comboToRef[keyCombo] != nil {
-            print("Hotkey already registered: \(keyCombo)")
-            isRegistered = true
-            return true
+        print("Attempting to register hotkey: \(keyCombo)")
+        
+        guard hasAccessibilityPermission() else {
+            print("Hotkey registration failed: No accessibility permission")
+            isRegistered = false
+            return false
         }
         
         guard let (keyCode, modifiers) = parseKeyCombo(keyCombo) else {
-            print("Invalid hotkey combo: \(keyCombo)")
+            print("Hotkey registration failed: Invalid key combo \(keyCombo)")
             return false
         }
         
-        // Disallow some well-known system combos
-        let reserved: Set<String> = ["⌘V","⌘C","⌘X","⌘Z"]
-        if reserved.contains(keyCombo) {
-            print("Reserved system shortcut: \(keyCombo)")
+        let reservedShortcuts = ["⌘V", "⌘C", "⌘X", "⌘Z"]
+        if reservedShortcuts.contains(where: { $0 == keyCombo }) {
+            print("Hotkey registration failed: \(keyCombo) is a reserved shortcut")
             return false
+        }
+        
+        if hotkeyRefs[keyCombo] != nil {
+            print("Hotkey already registered: \(keyCombo)")
+            return true
         }
         
         var hotkeyRef: EventHotKeyRef?
-        let hotkeyID = EventHotKeyID(signature: "CMAC".fourCharCode, id: stableID(for: keyCombo))
+        let hotkeyID = EventHotKeyID(signature: "CMAC".fourCharCode, id: UInt32(keyCombo.hashValue & 0xFFFF))
+        
         let status = RegisterEventHotKey(
             UInt32(keyCode),
             modifiers,
@@ -265,69 +334,62 @@ class GlobalHotkeyManager: ObservableObject {
         )
         
         if status == noErr, let ref = hotkeyRef {
-            comboToRef[keyCombo] = ref
-            idToCombo[hotkeyID.id] = keyCombo
-            print("Registered hotkey: \(keyCombo) (id=\(hotkeyID.id))")
-            isRegistered = !comboToRef.isEmpty
+            hotkeyRefs[keyCombo] = ref
+            print("Hotkey registered successfully: \(keyCombo)")
+            isRegistered = !hotkeyRefs.isEmpty
             return true
-        } else {
-            print("RegisterEventHotKey failed (\(status)) for \(keyCombo)")
-            return false
         }
+        
+        print("Hotkey registration failed with status: \(status)")
+        return false
     }
     
     func unregisterHotkey(_ keyCombo: String) {
-        if let ref = comboToRef[keyCombo] {
+        if let ref = hotkeyRefs[keyCombo] {
             UnregisterEventHotKey(ref)
-            comboToRef.removeValue(forKey: keyCombo)
-            let id = stableID(for: keyCombo)
-            idToCombo.removeValue(forKey: id)
+            hotkeyRefs.removeValue(forKey: keyCombo)
+            print("Unregistered hotkey: \(keyCombo)")
         }
-        isRegistered = !comboToRef.isEmpty
+        isRegistered = !hotkeyRefs.isEmpty
     }
     
     func unregisterAllHotkeys() {
-        for (_, ref) in comboToRef {
+        for (combo, ref) in hotkeyRefs {
             UnregisterEventHotKey(ref)
+            print("Unregistered hotkey: \(combo)")
         }
-        comboToRef.removeAll()
-        idToCombo.removeAll()
+        hotkeyRefs.removeAll()
         isRegistered = false
     }
     
-    // "⌘A", "⌥`", "⇧F1", etc.
     func parseKeyCombo(_ combo: String) -> (keyCode: CGKeyCode, modifiers: UInt32)? {
         var modifiers: UInt32 = 0
-        let raw = combo
+        let keyChar = combo
         
-        if raw.contains("⌘") { modifiers |= UInt32(cmdKey) }
-        if raw.contains("⇧") { modifiers |= UInt32(shiftKey) }
-        if raw.contains("⌃") { modifiers |= UInt32(controlKey) }
-        if raw.contains("⌥") { modifiers |= UInt32(optionKey) }
-        if raw.contains("⇪") { modifiers |= 0x10000 } // caps lock
+        let modifierSymbols = ["⌘", "⇧", "⌃", "⌥", "⇪", "⇥", " ", "↑", "↓", "←", "→"]
+        let replacements = ["", "", "", "", "", "TAB", "SPACE", "UP", "DOWN", "LEFT", "RIGHT"]
         
-        // Normalize symbolic names to token words
-        let map: [(String, String)] = [
-            ("⇥","TAB"), (" ","SPACE"), ("↑","UP"), ("↓","DOWN"),
-            ("←","LEFT"), ("→","RIGHT")
-        ]
-        var normalized = raw
-        for (sym, token) in map {
-            normalized = normalized.replacingOccurrences(of: sym, with: token)
+        var cleanedCombo = keyChar
+        for (symbol, replacement) in zip(modifierSymbols, replacements) {
+            cleanedCombo = cleanedCombo.replacingOccurrences(of: symbol, with: replacement)
         }
-        normalized = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+        cleanedCombo = cleanedCombo.trimmingCharacters(in: .whitespacesAndNewlines)
         
-        // base key is the last token/char
-        let baseKey: String = {
-            let parts = normalized.split(separator: " ")
-            if let last = parts.last { return String(last).uppercased() }
-            return String(normalized.suffix(1)).uppercased()
-        }()
+        let baseKey = cleanedCombo.isEmpty ? keyChar : String(cleanedCombo.suffix(1))
         
-        guard let keyCode = charToKeyCode(baseKey) else {
-            print("Unknown base key: \(baseKey)")
+        if keyChar.range(of: "⌘") != nil { modifiers |= UInt32(cmdKey) }
+        if keyChar.range(of: "⇧") != nil { modifiers |= UInt32(shiftKey) }
+        if keyChar.range(of: "⌃") != nil { modifiers |= UInt32(controlKey) }
+        if keyChar.range(of: "⌥") != nil { modifiers |= UInt32(optionKey) }
+        if keyChar.range(of: "⇪") != nil { modifiers |= 0x10000 }
+        
+        let cleanKey = baseKey.uppercased()
+        guard let keyCode = charToKeyCode(cleanKey) else {
+            print("Invalid key code for: \(cleanKey)")
             return nil
         }
+        
+        print("Parsed combo \(combo): keyCode = \(keyCode), modifiers = \(String(format: "0x%X", modifiers))")
         return (keyCode, modifiers)
     }
     
@@ -345,12 +407,14 @@ class GlobalHotkeyManager: ObservableObject {
             "F9": 101, "F10": 109, "F11": 103, "F12": 111, "UP": 126,
             "DOWN": 125, "LEFT": 123, "RIGHT": 124
         ]
+        
         return keyMap[char]
     }
     
     func openAccessibilitySettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
+            print("Opened Accessibility settings")
         }
     }
     
@@ -431,6 +495,11 @@ enum AppSize: String, CaseIterable, Codable {
 struct KeyboardShortcut: Codable, Identifiable {
     let id: UUID
     let combo: String
+    
+    enum CodingKeys: String, CodingKey {
+        case id, combo
+    }
+    
     init(combo: String) {
         self.id = UUID()
         self.combo = combo
@@ -440,35 +509,84 @@ struct KeyboardShortcut: Codable, Identifiable {
 // MARK: - Theme Toggle Components
 struct ThemeToggle: View {
     @Binding var theme: Theme
+    
     var body: some View {
         HStack(spacing: 16) {
+            // Light Mode Button
             VStack(spacing: 6) {
-                Button(action: { withAnimation(.easeInOut(duration: 0.3)) { theme = .light } }) {
-                    ZStack {
-                        Circle().fill(theme == .light ? Color.orange.opacity(0.1) : Color.gray.opacity(0.05))
-                            .frame(width: 36, height: 36)
-                            .overlay(Circle().stroke(theme == .light ? Color.orange.opacity(0.3) : Color.gray.opacity(0.2), lineWidth: 1))
-                        Image(systemName: "sun.max.fill").font(.system(size: 16, weight: .medium))
-                            .foregroundColor(theme == .light ? Color.orange : Color.gray.opacity(0.6))
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        theme = .light
                     }
-                }.buttonStyle(.plain)
-                Text("Light").font(.caption2).foregroundColor(theme == .light ? Color.primary : Color.gray.opacity(0.6))
+                }) {
+                    ZStack {
+                        Circle()
+                            .fill(theme == .light ?
+                                  Color.orange.opacity(0.1) :
+                                  Color.gray.opacity(0.05))
+                            .frame(width: 36, height: 36)
+                            .overlay(
+                                Circle()
+                                    .stroke(theme == .light ?
+                                           Color.orange.opacity(0.3) :
+                                           Color.gray.opacity(0.2), lineWidth: 1)
+                            )
+                        
+                        Image(systemName: "sun.max.fill")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(theme == .light ?
+                                           Color.orange :
+                                           Color.gray.opacity(0.6))
+                    }
+                }
+                .buttonStyle(.plain)
+                
+                Text("Light")
+                    .font(.caption2)
+                    .foregroundColor(theme == .light ?
+                                   Color.primary :
+                                   Color.gray.opacity(0.6))
                     .fontWeight(theme == .light ? .medium : .regular)
             }
+            
+            // Dark Mode Button
             VStack(spacing: 6) {
-                Button(action: { withAnimation(.easeInOut(duration: 0.3)) { theme = .dark } }) {
-                    ZStack {
-                        Circle().fill(theme == .dark ? Color.blue.opacity(0.1) : Color.gray.opacity(0.05))
-                            .frame(width: 36, height: 36)
-                            .overlay(Circle().stroke(theme == .dark ? Color.blue.opacity(0.3) : Color.gray.opacity(0.2), lineWidth: 1))
-                        Image(systemName: "moon.fill").font(.system(size: 16, weight: .medium))
-                            .foregroundColor(theme == .dark ? Color.blue : Color.gray.opacity(0.6))
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        theme = .dark
                     }
-                }.buttonStyle(.plain)
-                Text("Dark").font(.caption2).foregroundColor(theme == .dark ? Color.primary : Color.gray.opacity(0.6))
+                }) {
+                    ZStack {
+                        Circle()
+                            .fill(theme == .dark ?
+                                  Color.blue.opacity(0.1) :
+                                  Color.gray.opacity(0.05))
+                            .frame(width: 36, height: 36)
+                            .overlay(
+                                Circle()
+                                    .stroke(theme == .dark ?
+                                           Color.blue.opacity(0.3) :
+                                           Color.gray.opacity(0.2), lineWidth: 1)
+                            )
+                        
+                        Image(systemName: "moon.fill")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(theme == .dark ?
+                                           Color.blue :
+                                           Color.gray.opacity(0.6))
+                    }
+                }
+                .buttonStyle(.plain)
+                
+                Text("Dark")
+                    .font(.caption2)
+                    .foregroundColor(theme == .dark ?
+                                   Color.primary :
+                                   Color.gray.opacity(0.6))
                     .fontWeight(theme == .dark ? .medium : .regular)
             }
-        }.accessibilityLabel("Theme Selection")
+        }
+        .accessibilityLabel("Theme Selection")
     }
 }
 
@@ -477,7 +595,16 @@ class ClipboardViewModel: ObservableObject {
     static let shared = ClipboardViewModel()
     
     @Published var items: [ClipboardItem] = []
-    @Published var theme: Theme = .light { didSet { saveSettings() } }
+    @Published var theme: Theme = .light {
+        didSet {
+            do {
+                try saveSettings()
+            } catch {
+                print("Failed to save settings in theme didSet: \(error)")
+                toast("Failed to save theme settings")
+            }
+        }
+    }
     @Published var appSize: AppSize = .small
     @Published var showSettings = false
     @Published var showToast = false
@@ -489,15 +616,31 @@ class ClipboardViewModel: ObservableObject {
     @Published var showPreview = false
     @Published var previewItem: ClipboardItem?
     @Published var highlightedItem: ClipboardItem?
-    @Published var searchText: String = "" { didSet { debounceSearch() } }
+    @Published var searchText: String = "" {
+        didSet {
+            debounceSearch()
+        }
+    }
     @Published var showReturnToTop = false
-    @Published var useMenuBarMode: Bool = false { didSet { saveSettings(); updateAppMode() } }
+    @Published var useMenuBarMode: Bool = false {
+        didSet {
+            do {
+                try saveSettings()
+            } catch {
+                print("Failed to save settings in useMenuBarMode didSet: \(error)")
+                toast("Failed to save menu bar settings")
+            }
+            updateAppMode()
+        }
+    }
     
     private var changeCount = NSPasteboard.general.changeCount
     private let historyKey = "ClipboardHistory"
     private var searchWorkItem: DispatchWorkItem?
     
-    var currentDimensions: (width: CGFloat, height: CGFloat) { appSize.dimensions }
+    var currentDimensions: (width: CGFloat, height: CGFloat) {
+        return appSize.dimensions
+    }
     
     init() {
         loadSettings()
@@ -505,11 +648,6 @@ class ClipboardViewModel: ObservableObject {
         
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.pollClipboard()
-        }
-        
-        // Register saved hotkeys shortly after launch
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.updateGlobalHotkeys()
         }
         
         NotificationCenter.default.addObserver(
@@ -521,12 +659,24 @@ class ClipboardViewModel: ObservableObject {
         }
         
         NotificationCenter.default.addObserver(
-            forName: NSNotification.Name("AccessibilityPermissionChanged"),
+            forName: NSNotification.Name("AccessibilityPermissionGranted"),
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            // Not required, but keep behavior: re-register
-            self?.updateGlobalHotkeys()
+            self?.onPermissionGranted()
+        }
+        
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("AccessibilityPermissionRevoked"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.onPermissionRevoked()
+        }
+        
+        // Initial hotkey registration check
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.checkAndRegisterHotkeys()
         }
     }
     
@@ -539,6 +689,23 @@ class ClipboardViewModel: ObservableObject {
         }
     }
     
+    private func checkAndRegisterHotkeys() {
+        if !keyboardShortcuts.isEmpty && GlobalHotkeyManager.shared.hasAccessibilityPermission() {
+            updateGlobalHotkeys()
+        }
+    }
+    
+    private func onPermissionGranted() {
+        print("Permission granted notification received")
+        updateGlobalHotkeys()
+        toast("Accessibility permission granted - shortcuts activated")
+    }
+    
+    private func onPermissionRevoked() {
+        print("Permission revoked notification received")
+        toast("Accessibility permission revoked - shortcuts disabled")
+    }
+    
     private func clearSelectionStates() {
         selectedItem = nil
         highlightedItem = nil
@@ -547,19 +714,24 @@ class ClipboardViewModel: ObservableObject {
     
     private func debounceSearch() {
         searchWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in self?.objectWillChange.send() }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.objectWillChange.send()
+        }
         searchWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: workItem)
     }
     
     var filteredItems: [ClipboardItem] {
-        let q = searchText.lowercased()
-        if q.isEmpty {
-            let favorites = items.filter { $0.isFavorite }.sorted { ($0.favoritePosition ?? 0) < ($1.favoritePosition ?? 0) }
-            let nonFav = items.filter { !$0.isFavorite }.sorted { $0.timestamp > $1.timestamp }
-            return favorites + nonFav
+        let searchLowercased = searchText.lowercased()
+        
+        if searchText.isEmpty {
+            let favorites = items.filter { $0.isFavorite }.sorted { (a, b) in
+                (a.favoritePosition ?? 0) < (b.favoritePosition ?? 0)
+            }
+            let nonFavorites = items.filter { !$0.isFavorite }.sorted { $0.timestamp > $1.timestamp }
+            return favorites + nonFavorites
         } else {
-            return items.filter { $0.lowercaseContent.contains(q) }
+            return items.filter { $0.lowercaseContent.contains(searchLowercased) }
         }
     }
     
@@ -567,6 +739,7 @@ class ClipboardViewModel: ObservableObject {
         let pb = NSPasteboard.general
         if pb.changeCount != changeCount {
             changeCount = pb.changeCount
+            
             if let str = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !str.isEmpty {
                 handleNewClipboardContent(content: str)
             } else if let imageData = pb.data(forType: .png) ?? pb.data(forType: .tiff) {
@@ -577,32 +750,50 @@ class ClipboardViewModel: ObservableObject {
     
     func handleNewClipboardContent(content: String = "", imageData: Data? = nil) {
         if !content.isEmpty {
-            if items.contains(where: { $0.content == content }) { return }
+            if items.contains(where: { $0.content == content }) {
+                return
+            }
             insert(content: content, showToast: false)
         } else if imageData != nil {
-            if items.contains(where: { $0.isImage && $0.imageData == imageData }) { return }
+            if items.contains(where: { $0.isImage && $0.imageData == imageData }) {
+                return
+            }
             insert(imageData: imageData, showToast: false)
         }
     }
     
     func insert(content: String = "", imageData: Data? = nil, isFavorite: Bool = false, showToast: Bool = true) {
         let newItem = ClipboardItem(content: content, imageData: imageData, isFavorite: isFavorite)
+        
         items.insert(newItem, at: 0)
-        if showToast { toast(isFavorite ? "Favorite Added" : "Item Added") }
+        
+        if showToast {
+            toast(isFavorite ? "Favorite Added" : "Item Added")
+        }
+        
         saveHistory()
-        DispatchQueue.main.async { self.objectWillChange.send() }
+        
+        DispatchQueue.main.async {
+            self.objectWillChange.send()
+        }
     }
     
     func copy(_ item: ClipboardItem) {
         NSPasteboard.general.clearContents()
+        
         if item.isImage, let imageData = item.imageData {
             NSPasteboard.general.setData(imageData, forType: .png)
         } else {
             NSPasteboard.general.setString(item.content, forType: .string)
         }
+        
         selectedItem = item
         toast("Copied")
-        if !item.isFavorite { moveItemToTop(item) }
+        
+        if !item.isFavorite {
+            moveItemToTop(item)
+        }
+        
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             GlobalHotkeyManager.shared.hideApp()
         }
@@ -610,23 +801,31 @@ class ClipboardViewModel: ObservableObject {
     
     func copyFromPreview(_ item: ClipboardItem) {
         NSPasteboard.general.clearContents()
+        
         if item.isImage, let imageData = item.imageData {
             NSPasteboard.general.setData(imageData, forType: .png)
         } else {
             NSPasteboard.general.setString(item.content, forType: .string)
         }
+        
         selectedItem = item
         toast("Copied")
-        if !item.isFavorite { moveItemToTop(item) }
+        
+        if !item.isFavorite {
+            moveItemToTop(item)
+        }
     }
     
     private func moveItemToTop(_ item: ClipboardItem) {
-        if let idx = items.firstIndex(where: { $0.id == item.id }) {
-            var moved = items[idx]
-            items.remove(at: idx)
-            let favCount = items.filter { $0.isFavorite }.count
-            moved.timestamp = Date()
-            items.insert(moved, at: favCount)
+        if let currentIndex = items.firstIndex(where: { $0.id == item.id }) {
+            let itemToMove = items[currentIndex]
+            items.remove(at: currentIndex)
+            
+            let favoriteCount = items.filter { $0.isFavorite }.count
+            var updatedItem = itemToMove
+            updatedItem.timestamp = Date()
+            items.insert(updatedItem, at: favoriteCount)
+            
             saveHistory()
         }
     }
@@ -637,36 +836,49 @@ class ClipboardViewModel: ObservableObject {
             self.showPreview = true
         }
     }
-    func hidePreview() { showPreview = false; previewItem = nil }
+    
+    func hidePreview() {
+        showPreview = false
+        previewItem = nil
+    }
     
     func handleItemTap(_ item: ClipboardItem) {
         highlightedItem = item
-        let current = clickCount[item.id] ?? 0
-        clickCount[item.id] = current + 1
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.clickCount[item.id] = 0 }
+        
+        let currentCount = clickCount[item.id] ?? 0
+        clickCount[item.id] = currentCount + 1
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            self.clickCount[item.id] = 0
+        }
+        
         if clickCount[item.id] == 2 {
             copy(item)
             clickCount[item.id] = 0
         } else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                if self.clickCount[item.id] == 0 { self.highlightedItem = nil }
+                if self.clickCount[item.id] == 0 {
+                    self.highlightedItem = nil
+                }
             }
         }
     }
     
     func toggleFavorite(_ item: ClipboardItem) {
         if let idx = items.firstIndex(of: item) {
-            var updated = items[idx]
-            updated.isFavorite.toggle()
+            var updatedItem = items[idx]
+            updatedItem.isFavorite.toggle()
+            
             items.remove(at: idx)
-            if updated.isFavorite {
-                let maxPos = items.filter { $0.isFavorite }.compactMap { $0.favoritePosition }.max() ?? -1
-                updated.favoritePosition = maxPos + 1
-                items.insert(updated, at: 0)
+            
+            if updatedItem.isFavorite {
+                let maxPosition = items.filter { $0.isFavorite }.compactMap { $0.favoritePosition }.max() ?? -1
+                updatedItem.favoritePosition = maxPosition + 1
+                items.insert(updatedItem, at: 0)
             } else {
-                updated.favoritePosition = nil
-                let favCount = items.filter { $0.isFavorite }.count
-                items.insert(updated, at: favCount)
+                updatedItem.favoritePosition = nil
+                let favoriteCount = items.filter { $0.isFavorite }.count
+                items.insert(updatedItem, at: favoriteCount)
             }
             saveHistory()
         }
@@ -683,36 +895,49 @@ class ClipboardViewModel: ObservableObject {
     }
     
     func moveFavoriteUp(_ item: ClipboardItem) {
-        guard item.isFavorite, let curr = items.firstIndex(of: item) else { return }
-        let beforeFavs = items[..<curr].filter { $0.isFavorite }
-        guard let target = beforeFavs.last, let tIdx = items.firstIndex(of: target) else { return }
-        items.swapAt(curr, tIdx)
+        guard item.isFavorite, let currentIndex = items.firstIndex(of: item) else { return }
+        
+        let favoritesBeforeCurrent = items[..<currentIndex].filter { $0.isFavorite }
+        guard let targetItem = favoritesBeforeCurrent.last,
+              let targetIndex = items.firstIndex(of: targetItem) else { return }
+        
+        items.swapAt(currentIndex, targetIndex)
         updateFavoritePositions()
         saveHistory()
         toast("Moved up")
     }
     
     func moveFavoriteDown(_ item: ClipboardItem) {
-        guard item.isFavorite, let curr = items.firstIndex(of: item) else { return }
-        let afterFavs = items[(curr + 1)...].filter { $0.isFavorite }
-        guard let target = afterFavs.first, let tIdx = items.firstIndex(of: target) else { return }
-        items.swapAt(curr, tIdx)
+        guard item.isFavorite, let currentIndex = items.firstIndex(of: item) else { return }
+        
+        let favoritesAfterCurrent = items[(currentIndex + 1)...].filter { $0.isFavorite }
+        guard let targetItem = favoritesAfterCurrent.first,
+              let targetIndex = items.firstIndex(of: targetItem) else { return }
+        
+        items.swapAt(currentIndex, targetIndex)
         updateFavoritePositions()
         saveHistory()
         toast("Moved down")
     }
     
     private func updateFavoritePositions() {
-        let favs = items.filter { $0.isFavorite }
-        for (i, fav) in favs.enumerated() {
-            if let idx = items.firstIndex(where: { $0.id == fav.id }) {
-                items[idx].favoritePosition = i
+        let favoriteItems = items.filter { $0.isFavorite }
+        for (index, item) in favoriteItems.enumerated() {
+            if let itemIndex = items.firstIndex(where: { $0.id == item.id }) {
+                items[itemIndex].favoritePosition = index
             }
         }
     }
     
-    // UI → combo string creation and persistence
     func addShortcut(key: String, modifier: String) {
+        print("Adding shortcut - key: '\(key)', modifier: '\(modifier)'")
+        
+        if modifier == "None" {
+            print("No modifier selected - Carbon requires at least one modifier")
+            toast("Please select a modifier key (⌘, ⌥, ⌃, or ⇧)")
+            return
+        }
+        
         let modifierMap: [String: String] = [
             "Command (⌘)": "⌘",
             "Option (⌥)": "⌥",
@@ -726,58 +951,110 @@ class ClipboardViewModel: ObservableObject {
             "Left Arrow (←)": "←",
             "Right Arrow (→)": "→"
         ]
-        let sym = modifierMap[modifier] ?? ""
-        if sym.isEmpty {
-            toast("Please select a modifier key (⌘, ⌥, ⌃, or ⇧)")
-            return
-        }
-        let combo = sym + key
-        if keyboardShortcuts.contains(where: { $0.combo == combo }) {
+        
+        let fullCombo = (modifierMap[modifier] ?? "") + key
+        print("Full combo created: '\(fullCombo)'")
+        
+        if keyboardShortcuts.contains(where: { $0.combo == fullCombo }) {
+            print("Shortcut already exists: \(fullCombo)")
             toast("Shortcut already exists")
             return
         }
         
-        // Persist first, then attempt registration. If registration fails, keep it saved for later tries.
-        keyboardShortcuts.append(KeyboardShortcut(combo: combo))
-        saveSettings()
+        // Save the shortcut
+        keyboardShortcuts.append(KeyboardShortcut(combo: fullCombo))
+        do {
+            try saveSettings()
+        } catch {
+            print("Failed to save settings: \(error)")
+            toast("Failed to save shortcut - check storage permissions")
+            keyboardShortcuts.removeAll { $0.combo == fullCombo }
+            return
+        }
         
-        if GlobalHotkeyManager.shared.registerHotkey(combo) {
-            toast("Shortcut registered: \(combo)")
+        // Attempt registration
+        if GlobalHotkeyManager.shared.hasAccessibilityPermission() {
+            attemptHotkeyRegistration(fullCombo: fullCombo)
         } else {
-            toast("Couldn’t activate now. It will try again on next launch.")
+            print("No accessibility permission - requesting...")
+            toast("Please grant accessibility permission in System Settings to activate shortcuts")
+            GlobalHotkeyManager.shared.requestAccessibilityPermission()
+        }
+    }
+    
+    private func attemptHotkeyRegistration(fullCombo: String) {
+        if GlobalHotkeyManager.shared.registerHotkey(fullCombo) {
+            print("Shortcut registered successfully: \(fullCombo)")
+            toast("Shortcut registered: \(fullCombo)")
+        } else {
+            print("Failed to register shortcut: \(fullCombo)")
+            toast("Failed to register shortcut - try a different combination")
+            keyboardShortcuts.removeAll { $0.combo == fullCombo }
+            do {
+                try saveSettings()
+            } catch {
+                print("Failed to save settings after removing failed shortcut: \(error)")
+            }
         }
     }
     
     func removeShortcut(_ shortcut: String) {
         keyboardShortcuts.removeAll { $0.combo == shortcut }
         GlobalHotkeyManager.shared.unregisterHotkey(shortcut)
-        saveSettings()
+        do {
+            try saveSettings()
+        } catch {
+            print("Failed to save settings after removing shortcut: \(error)")
+            toast("Failed to save settings - check storage permissions")
+        }
         toast("Shortcut removed")
     }
     
     func updateGlobalHotkeys() {
-        print("Re-registering global hotkeys…")
+        print("Updating all global hotkeys")
         GlobalHotkeyManager.shared.unregisterAllHotkeys()
         
-        // Snapshot to avoid mutating during iteration
-        let combos = keyboardShortcuts.map { $0.combo }
-        var successes = 0
-        var failures: [String] = []
-        for combo in combos {
-            if GlobalHotkeyManager.shared.registerHotkey(combo) {
-                successes += 1
+        guard GlobalHotkeyManager.shared.hasAccessibilityPermission() else {
+            print("Cannot register hotkeys: No accessibility permission")
+            toast("Accessibility permission required for shortcuts")
+            return
+        }
+        
+        var successCount = 0
+        var failedShortcuts: [String] = []
+        
+        for shortcut in keyboardShortcuts {
+            if GlobalHotkeyManager.shared.registerHotkey(shortcut.combo) {
+                successCount += 1
+                print("Registered shortcut: \(shortcut.combo)")
             } else {
-                failures.append(combo)
+                print("Failed to register: \(shortcut.combo)")
+                failedShortcuts.append(shortcut.combo)
             }
         }
-        // Keep saved shortcuts even if not currently registerable
-        if successes > 0 { toast("\(successes) shortcut(s) active") }
-        if !failures.isEmpty { print("Failed to register: \(failures)") }
+        
+        // Remove failed shortcuts
+        keyboardShortcuts.removeAll { failedShortcuts.contains($0.combo) }
+        do {
+            try saveSettings()
+        } catch {
+            print("Failed to save settings after updating hotkeys: \(error)")
+            toast("Failed to save shortcut settings")
+        }
+        
+        if successCount > 0 {
+            toast("\(successCount) shortcut(s) activated")
+        } else if !keyboardShortcuts.isEmpty {
+            toast("Failed to register shortcuts - try different combinations")
+        }
     }
     
     func exportHistory() {
         let textItems = items.compactMap { item -> String? in
-            if item.isImage { return nil }
+            if item.isImage {
+                return nil
+            }
+            
             let prefix = item.isFavorite ? "[FAVORITE] " : ""
             return prefix + item.content.trimmingCharacters(in: .whitespacesAndNewlines)
         }.filter { !$0.isEmpty }
@@ -793,9 +1070,13 @@ class ClipboardViewModel: ObservableObject {
             if response == .OK, let url = savePanel.url {
                 do {
                     try exportContent.write(to: url, atomically: true, encoding: .utf8)
-                    DispatchQueue.main.async { self.toast("Exported \(textItems.count) items") }
+                    DispatchQueue.main.async {
+                        self.toast("Exported \(textItems.count) items")
+                    }
                 } catch {
-                    DispatchQueue.main.async { self.toast("Export failed: \(error.localizedDescription)") }
+                    DispatchQueue.main.async {
+                        self.toast("Export failed: \(error.localizedDescription)")
+                    }
                 }
             }
         }
@@ -811,9 +1092,13 @@ class ClipboardViewModel: ObservableObject {
             if response == .OK, let url = openPanel.url {
                 do {
                     let fileContent = try String(contentsOf: url, encoding: .utf8)
-                    DispatchQueue.main.async { self.processImportedText(fileContent) }
+                    DispatchQueue.main.async {
+                        self.processImportedText(fileContent)
+                    }
                 } catch {
-                    DispatchQueue.main.async { self.toast("Import failed: \(error.localizedDescription)") }
+                    DispatchQueue.main.async {
+                        self.toast("Import failed: \(error.localizedDescription)")
+                    }
                 }
             }
         }
@@ -824,76 +1109,105 @@ class ClipboardViewModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         
-        var imported: [ClipboardItem] = []
+        var importedItems: [ClipboardItem] = []
+        
         for entry in entries {
-            let isFav = entry.hasPrefix("[FAVORITE] ")
-            let content = isFav ? String(entry.dropFirst(11)) : entry
+            let isFavorite = entry.hasPrefix("[FAVORITE] ")
+            let content = isFavorite ? String(entry.dropFirst(11)) : entry
+            
             if !content.isEmpty {
-                var item = ClipboardItem(content: content, isFavorite: isFav)
-                if isFav {
-                    item.favoritePosition = imported.filter { $0.isFavorite }.count
+                var item = ClipboardItem(content: content, isFavorite: isFavorite)
+                if isFavorite {
+                    item.favoritePosition = importedItems.filter { $0.isFavorite }.count
                 }
-                imported.append(item)
+                importedItems.append(item)
             }
         }
-        for item in imported.reversed() {
+        
+        for item in importedItems.reversed() {
             if !items.contains(where: { $0.content == item.content }) {
                 if item.isFavorite {
-                    let maxPos = items.filter { $0.isFavorite }.compactMap { $0.favoritePosition }.max() ?? -1
-                    var u = item
-                    u.favoritePosition = maxPos + 1
-                    items.insert(u, at: 0)
+                    let maxPosition = items.filter { $0.isFavorite }.compactMap { $0.favoritePosition }.max() ?? -1
+                    var updatedItem = item
+                    updatedItem.favoritePosition = maxPosition + 1
+                    items.insert(updatedItem, at: 0)
                 } else {
-                    let favCount = items.filter { $0.isFavorite }.count
-                    items.insert(item, at: favCount)
+                    let favoriteCount = items.filter { $0.isFavorite }.count
+                    items.insert(item, at: favoriteCount)
                 }
             }
         }
+        
         saveHistory()
-        toast("Imported \(imported.count) items")
+        toast("Imported \(importedItems.count) items")
     }
     
     func toast(_ text: String) {
         toastText = text
         showToast = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.showToast = false }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            self.showToast = false
+        }
     }
     
     private func saveHistory() {
-        if let data = try? JSONEncoder().encode(items) {
-            UserDefaults.standard.set(data, forKey: historyKey)
+        do {
+            if let data = try? JSONEncoder().encode(items) {
+                UserDefaults.standard.set(data, forKey: historyKey)
+                if UserDefaults.standard.data(forKey: historyKey) == nil {
+                    throw NSError(domain: "CopyMac", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to save clipboard history"])
+                }
+                print("Saved clipboard history")
+            }
+        } catch {
+            print("Failed to save history: \(error)")
+            toast("Failed to save clipboard history")
         }
     }
     
     private func loadHistory() {
         if let data = UserDefaults.standard.data(forKey: historyKey),
-           let saved = try? JSONDecoder().decode([ClipboardItem].self, from: data) {
-            items = saved
+           let savedItems = try? JSONDecoder().decode([ClipboardItem].self, from: data) {
+            items = savedItems
+            print("Loaded clipboard history: \(items.count) items")
         }
     }
     
-    private func saveSettings() {
+    private func saveSettings() throws {
+        let defaults = UserDefaults.standard
         if let shortcutData = try? JSONEncoder().encode(keyboardShortcuts) {
-            UserDefaults.standard.set(shortcutData, forKey: "KeyboardShortcuts")
+            defaults.set(shortcutData, forKey: "KeyboardShortcuts")
+            if defaults.data(forKey: "KeyboardShortcuts") == nil {
+                throw NSError(domain: "CopyMac", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to save keyboard shortcuts"])
+            }
         }
         if let themeData = try? JSONEncoder().encode(theme) {
-            UserDefaults.standard.set(themeData, forKey: "AppTheme")
+            defaults.set(themeData, forKey: "AppTheme")
+            if defaults.data(forKey: "AppTheme") == nil {
+                throw NSError(domain: "CopyMac", code: -4, userInfo: [NSLocalizedDescriptionKey: "Failed to save theme settings"])
+            }
         }
-        UserDefaults.standard.set(useMenuBarMode, forKey: "UseMenuBarMode")
-        UserDefaults.standard.synchronize()
+        defaults.set(useMenuBarMode, forKey: "UseMenuBarMode")
+        print("Saved settings: \(keyboardShortcuts.count) shortcuts, theme: \(theme.rawValue), menuBar: \(useMenuBarMode)")
     }
     
     private func loadSettings() {
         if let shortcutData = UserDefaults.standard.data(forKey: "KeyboardShortcuts"),
            let savedShortcuts = try? JSONDecoder().decode([KeyboardShortcut].self, from: shortcutData) {
             keyboardShortcuts = savedShortcuts
+            print("Loaded \(keyboardShortcuts.count) shortcuts")
         }
+        
         if let themeData = UserDefaults.standard.data(forKey: "AppTheme"),
            let savedTheme = try? JSONDecoder().decode(Theme.self, from: themeData) {
             theme = savedTheme
+            print("Loaded theme: \(theme.rawValue)")
         }
+        
         useMenuBarMode = UserDefaults.standard.bool(forKey: "UseMenuBarMode")
-        if useMenuBarMode { updateAppMode() }
+        if useMenuBarMode {
+            updateAppMode()
+        }
     }
 }
 
@@ -939,12 +1253,17 @@ struct ClipboardAppView: View {
             .onAppear {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
+                
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    vm.updateGlobalHotkeys()
+                    if !vm.keyboardShortcuts.isEmpty && hotkeyManager.hasAccessibilityPermission() {
+                        vm.updateGlobalHotkeys()
+                    }
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                vm.updateGlobalHotkeys()
+                if !vm.keyboardShortcuts.isEmpty && hotkeyManager.hasAccessibilityPermission() && !hotkeyManager.isRegistered {
+                    vm.updateGlobalHotkeys()
+                }
             }
             
             if vm.showSettings { settingsPanel }
@@ -975,31 +1294,50 @@ struct ClipboardAppView: View {
             HStack(spacing: 8) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8)
-                        .fill(LinearGradient(colors: [Color.blue, Color.purple], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .fill(LinearGradient(
+                            colors: [Color.blue, Color.purple],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ))
                         .frame(width: 28, height: 28)
+                    
                     Image(systemName: "doc.on.clipboard")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(.white)
                 }
-                Text("CopyMac").font(.headline)
+                
+                Text("CopyMac")
+                    .font(.headline)
             }
+            
             Spacer()
+            
             Button(action: {
                 NotificationCenter.default.post(name: NSNotification.Name("ScrollToTop"), object: nil)
             }) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 5)
-                        .fill(LinearGradient(colors: [Color.blue, Color.purple], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .fill(LinearGradient(
+                            colors: [Color.blue, Color.purple],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ))
                         .frame(width: 18, height: 18)
+                    
                     Image(systemName: "arrow.up")
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundColor(.white)
-                }.contentShape(Rectangle())
+                }
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Return to Top")
+            
             Button(action: { vm.showSettings.toggle() }) {
-                Image(systemName: "ellipsis").font(.title2).padding(8).contentShape(Rectangle())
+                Image(systemName: "ellipsis")
+                    .font(.title2)
+                    .padding(8)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Settings")
@@ -1015,18 +1353,30 @@ struct ClipboardAppView: View {
                     LazyVStack(spacing: 0) {
                         if vm.filteredItems.isEmpty {
                             VStack(spacing: 16) {
-                                Image(systemName: "doc.on.clipboard").font(.system(size: 48)).foregroundColor(.gray)
+                                Image(systemName: "doc.on.clipboard")
+                                    .font(.system(size: 48))
+                                    .foregroundColor(.gray)
+                                
                                 if vm.searchText.isEmpty {
-                                    Text("Copy some text to get started!").font(.headline).foregroundColor(.gray)
+                                    Text("Copy some text to get started!")
+                                        .font(.headline)
+                                        .foregroundColor(.gray)
                                 } else {
-                                    Text("No matching items found").font(.headline).foregroundColor(.gray)
-                                    Text("Try a different search term").font(.subheadline).foregroundColor(.gray)
+                                    Text("No matching items found")
+                                        .font(.headline)
+                                        .foregroundColor(.gray)
+                                    Text("Try a different search term")
+                                        .font(.subheadline)
+                                        .foregroundColor(.gray)
                                 }
                             }
                             .padding(.top, 60)
                             .id("topAnchor")
                         } else {
-                            Color.clear.frame(height: 1).id("topAnchor")
+                            Color.clear
+                                .frame(height: 1)
+                                .id("topAnchor")
+                            
                             ForEach(Array(vm.filteredItems.enumerated()), id: \.1.id) { index, item in
                                 itemRow(item: item, index: index)
                             }
@@ -1034,9 +1384,12 @@ struct ClipboardAppView: View {
                     }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ScrollToTop"))) { _ in
-                    withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo("topAnchor", anchor: .top) }
+                    withAnimation(.easeOut(duration: 0.3)) {
+                        proxy.scrollTo("topAnchor", anchor: .top)
+                    }
                 }
             }
+            
             searchBar
         }
     }
@@ -1046,6 +1399,7 @@ struct ClipboardAppView: View {
             Text(String(format: "%d.", index + 1))
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(.gray)
+            
             if item.isImage {
                 imageContent(item: item)
             } else {
@@ -1059,33 +1413,59 @@ struct ClipboardAppView: View {
         .background(rowBackground(item: item, index: index))
         .cornerRadius(3)
         .padding(.horizontal, 1)
-        .onTapGesture { vm.handleItemTap(item) }
-        .contextMenu { contextMenuContent(item: item) }
+        .onTapGesture {
+            vm.handleItemTap(item)
+        }
+        .contextMenu {
+            contextMenuContent(item: item)
+        }
     }
     
     func imageContent(item: ClipboardItem) -> some View {
         HStack {
-            Text("Image").font(.system(size: 10)).foregroundColor(.primary)
+            Text("Image")
+                .font(.system(size: 10))
+                .foregroundColor(.primary)
+            
             if let imageData = item.imageData, let nsImage = NSImage(data: imageData) {
-                Image(nsImage: nsImage).resizable().aspectRatio(contentMode: .fit)
-                    .frame(width: 20, height: 15).clipShape(RoundedRectangle(cornerRadius: 3))
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 20, height: 15)
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
             } else {
-                Image(systemName: "photo").foregroundColor(.blue).frame(width: 20, height: 15)
+                Image(systemName: "photo")
+                    .foregroundColor(.blue)
+                    .frame(width: 20, height: 15)
             }
+            
             Spacer()
-            if item.isFavorite { Image(systemName: "star.fill").font(.system(size: 10)).foregroundColor(.yellow) }
+            
+            if item.isFavorite {
+                Image(systemName: "star.fill")
+                    .font(.system(size: 10))
+                    .foregroundColor(.yellow)
+            }
         }
     }
     
     func textContent(item: ClipboardItem) -> some View {
         HStack {
-            let displayText = item.content.count > 500 ? String(item.content.prefix(500)) + "..." : item.content
+            let displayText = item.content.count > 500 ?
+                String(item.content.prefix(500)) + "..." :
+                item.content
+            
             Text(displayText.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\t", with: " "))
                 .font(.system(size: 11))
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            if item.isFavorite { Image(systemName: "star.fill").font(.system(size: 10)).foregroundColor(.yellow) }
+            
+            if item.isFavorite {
+                Image(systemName: "star.fill")
+                    .font(.system(size: 10))
+                    .foregroundColor(.yellow)
+            }
         }
     }
     
@@ -1095,34 +1475,60 @@ struct ClipboardAppView: View {
         } else if vm.highlightedItem?.id == item.id {
             return Color.blue.opacity(0.25)
         } else if index % 2 == 0 {
-            return vm.theme == .dark ? Color(red: 0.08, green: 0.08, blue: 0.08) : Color(red: 0.82, green: 0.82, blue: 0.82)
+            return vm.theme == .dark ?
+                Color(red: 0.08, green: 0.08, blue: 0.08) :
+                Color(red: 0.82, green: 0.82, blue: 0.82)
         } else {
-            return vm.theme == .dark ? Color(red: 0.12, green: 0.12, blue: 0.12) : Color(red: 0.88, green: 0.88, blue: 0.88)
+            return vm.theme == .dark ?
+                Color(red: 0.12, green: 0.12, blue: 0.12) :
+                Color(red: 0.88, green: 0.88, blue: 0.88)
         }
     }
     
     @ViewBuilder
     func contextMenuContent(item: ClipboardItem) -> some View {
-        Button("Preview") { vm.showPreviewFor(item) }
-        Button("Copy") { vm.copy(item) }
-        Divider()
-        if item.isFavorite {
-            Button("Move Up") { vm.moveFavoriteUp(item) }
-                .disabled(vm.items.filter { $0.isFavorite }.first?.id == item.id)
-            Button("Move Down") { vm.moveFavoriteDown(item) }
-                .disabled(vm.items.filter { $0.isFavorite }.last?.id == item.id)
-            Divider()
-            Button("Remove from Favorites") { vm.toggleFavorite(item) }
-        } else {
-            Button("Add to Favorites") { vm.toggleFavorite(item) }
+        Button("Preview") {
+            vm.showPreviewFor(item)
         }
+        Button("Copy") {
+            vm.copy(item)
+        }
+        
         Divider()
-        Button("Delete") { vm.delete(item) }
+        
+        if item.isFavorite {
+            Button("Move Up") {
+                vm.moveFavoriteUp(item)
+            }
+            .disabled(vm.items.filter { $0.isFavorite }.first?.id == item.id)
+            
+            Button("Move Down") {
+                vm.moveFavoriteDown(item)
+            }
+            .disabled(vm.items.filter { $0.isFavorite }.last?.id == item.id)
+            
+            Divider()
+            
+            Button("Remove from Favorites") {
+                vm.toggleFavorite(item)
+            }
+        } else {
+            Button("Add to Favorites") {
+                vm.toggleFavorite(item)
+            }
+        }
+        
+        Divider()
+        
+        Button("Delete") {
+            vm.delete(item)
+        }
     }
     
     var searchBar: some View {
         HStack {
-            Image(systemName: "magnifyingglass").foregroundColor(.gray)
+            Image(systemName: "magnifyingglass")
+                .foregroundColor(.gray)
             TextField("Search Clipboard Items", text: $vm.searchText)
                 .textFieldStyle(.plain)
                 .padding(.vertical, 4)
@@ -1131,8 +1537,11 @@ struct ClipboardAppView: View {
                 .cornerRadius(8)
                 .disabled(vm.showSettings)
             if !vm.searchText.isEmpty {
-                Button { vm.searchText = "" } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundColor(.gray)
+                Button {
+                    vm.searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.gray)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Clear Search")
@@ -1149,13 +1558,23 @@ struct ClipboardAppView: View {
                 HStack {
                     Text("Settings").font(.headline)
                     Spacer()
-                    Button { vm.showSettings = false } label: {
+                    Button {
+                        vm.showSettings = false
+                    } label: {
                         ZStack {
                             RoundedRectangle(cornerRadius: 5)
-                                .fill(LinearGradient(colors: [Color.blue, Color.purple], startPoint: .topLeading, endPoint: .bottomTrailing))
+                                .fill(LinearGradient(
+                                    colors: [Color.blue, Color.purple],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                ))
                                 .frame(width: 18, height: 18)
-                            Image(systemName: "xmark").font(.system(size: 9, weight: .semibold)).foregroundColor(.white)
-                        }.contentShape(Rectangle())
+                            
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(.white)
+                        }
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Close Settings")
@@ -1172,19 +1591,32 @@ struct ClipboardAppView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     // Access Mode Section
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Access Mode").font(.subheadline).fontWeight(.bold)
+                        Text("Access Mode")
+                            .font(.subheadline)
+                            .fontWeight(.bold)
+                        
                         VStack(alignment: .leading, spacing: 8) {
+                            // Menu Bar Mode
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
                                     HStack {
-                                        Image(systemName: "checkmark.circle.fill").foregroundColor(.green).font(.caption)
-                                        Text("Menu Bar Mode").font(.caption).fontWeight(.medium)
-                                        Text("(No permission needed)").font(.caption2).foregroundColor(.green)
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundColor(.green)
+                                            .font(.caption)
+                                        Text("Menu Bar Mode")
+                                            .font(.caption)
+                                            .fontWeight(.medium)
+                                        Text("(No permission needed)")
+                                            .font(.caption2)
+                                            .foregroundColor(.green)
                                     }
-                                    Text("Click menu bar icon to open").font(.caption2).foregroundColor(.secondary)
+                                    Text("Click menu bar icon to open")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
                                 }
                                 Spacer()
-                                Toggle("", isOn: $vm.useMenuBarMode).labelsHidden()
+                                Toggle("", isOn: $vm.useMenuBarMode)
+                                    .labelsHidden()
                             }
                             .padding(8)
                             .background(Color.green.opacity(0.1))
@@ -1195,7 +1627,10 @@ struct ClipboardAppView: View {
                     Divider()
                     
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Add Manual Entry").font(.subheadline).fontWeight(.bold)
+                        Text("Add Manual Entry")
+                            .font(.subheadline)
+                            .fontWeight(.bold)
+                        
                         HStack(spacing: 8) {
                             TextField("Type your text here", text: $manualText)
                                 .textFieldStyle(.plain)
@@ -1203,7 +1638,11 @@ struct ClipboardAppView: View {
                                 .padding(.horizontal, 12)
                                 .background(Color(NSColor.controlBackgroundColor))
                                 .cornerRadius(8)
-                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(manualText.isEmpty ? Color.clear : Color.blue, lineWidth: 2))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(manualText.isEmpty ? Color.clear : Color.blue, lineWidth: 2)
+                                )
+                            
                             Button("Add") {
                                 if !manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                     vm.insert(content: manualText, isFavorite: addToFavorites, showToast: true)
@@ -1214,34 +1653,77 @@ struct ClipboardAppView: View {
                             .buttonStyle(.borderedProminent)
                             .disabled(manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
-                        Toggle("Add to favorites", isOn: $addToFavorites).font(.caption)
+                        
+                        Toggle("Add to favorites", isOn: $addToFavorites)
+                            .font(.caption)
                     }
                     
                     Divider()
                     
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text("Global Shortcuts").font(.subheadline).fontWeight(.bold)
+                            Text("Global Shortcuts")
+                                .font(.subheadline)
+                                .fontWeight(.bold)
+                            
                             Spacer()
+                            
                             HStack(spacing: 4) {
-                                Circle().fill(hotkeyManager.isRegistered ? Color.green : Color.red).frame(width: 6, height: 6)
-                                Text(hotkeyManager.isRegistered ? "Active" : "Inactive").font(.caption2).foregroundColor(.secondary)
+                                Circle()
+                                    .fill(hotkeyManager.isRegistered ? Color.green : Color.red)
+                                    .frame(width: 6, height: 6)
+                                Text(hotkeyManager.isRegistered ? "Active" : "Inactive")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
                             }
                         }
                         
                         if !hotkeyManager.permissionGranted {
                             HStack {
-                                Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange).font(.caption)
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                                    .font(.caption)
+                                
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text("Accessibility permission optional").font(.caption).foregroundColor(.orange)
+                                    Text("Accessibility permission required for shortcuts")
+                                        .font(.caption)
+                                        .foregroundColor(.orange)
+                                    
                                     HStack {
                                         Button("Open System Settings") {
                                             hotkeyManager.openAccessibilitySettings()
+                                            hotkeyManager.requestAccessibilityPermission()
+                                        }
+                                        .font(.caption)
+                                        .buttonStyle(.borderedProminent)
+                                        
+                                        Button("Check Permission") {
+                                            if hotkeyManager.hasAccessibilityPermission() {
+                                                vm.updateGlobalHotkeys()
+                                                vm.toast("Permission granted - shortcuts activated")
+                                            } else {
+                                                vm.toast("Permission not granted - please enable in System Settings")
+                                            }
                                         }
                                         .font(.caption)
                                         .buttonStyle(.bordered)
                                     }
                                 }
+                            }
+                            .padding(8)
+                            .background(Color.orange.opacity(0.1))
+                            .cornerRadius(8)
+                        } else if !hotkeyManager.isRegistered && !vm.keyboardShortcuts.isEmpty {
+                            HStack {
+                                Text("Permission granted but shortcuts not active")
+                                    .font(.caption)
+                                    .foregroundColor(.orange)
+                                
+                                Button("Activate Shortcuts") {
+                                    vm.updateGlobalHotkeys()
+                                }
+                                .font(.caption)
+                                .buttonStyle(.borderedProminent)
                             }
                             .padding(8)
                             .background(Color.orange.opacity(0.1))
@@ -1255,16 +1737,24 @@ struct ClipboardAppView: View {
                                     .padding(6)
                                     .background(Color(NSColor.controlBackgroundColor))
                                     .cornerRadius(4)
+                                
                                 Spacer()
-                                Button { vm.removeShortcut(shortcut.combo) } label: {
-                                    Image(systemName: "minus.circle.fill").foregroundColor(.red)
+                                
+                                Button {
+                                    vm.removeShortcut(shortcut.combo)
+                                } label: {
+                                    Image(systemName: "minus.circle.fill")
+                                        .foregroundColor(.red)
                                 }
                                 .buttonStyle(.plain)
                             }
                         }
                         
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Add New Shortcut").font(.caption).foregroundColor(.secondary)
+                            Text("Add New Shortcut")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            
                             HStack {
                                 TextField("e.g., ` or §", text: $newShortcut)
                                     .textFieldStyle(.plain)
@@ -1272,6 +1762,7 @@ struct ClipboardAppView: View {
                                     .padding(.horizontal, 8)
                                     .background(Color(NSColor.controlBackgroundColor))
                                     .cornerRadius(8)
+                                
                                 Picker("", selection: $selectedHotkey) {
                                     ForEach(availableHotkeys, id: \.self) { hotkey in
                                         Text(hotkey).tag(hotkey)
@@ -1280,6 +1771,7 @@ struct ClipboardAppView: View {
                                 .pickerStyle(.menu)
                                 .frame(width: 150)
                             }
+                            
                             Button("Add") {
                                 if !newShortcut.isEmpty {
                                     vm.addShortcut(key: newShortcut, modifier: selectedHotkey)
@@ -1296,34 +1788,60 @@ struct ClipboardAppView: View {
                     Divider()
                     
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Theme").font(.subheadline).fontWeight(.bold)
-                        ThemeToggle(theme: $vm.theme).frame(maxWidth: .infinity, alignment: .leading)
+                        Text("Theme")
+                            .font(.subheadline)
+                            .fontWeight(.bold)
+                        
+                        ThemeToggle(theme: $vm.theme)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     
                     Divider()
                     
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Import/Export").font(.subheadline).fontWeight(.bold)
+                        Text("Import/Export")
+                            .font(.subheadline)
+                            .fontWeight(.bold)
+                        
                         HStack(spacing: 12) {
-                            Button("Export History") { vm.exportHistory() }.buttonStyle(.borderedProminent)
-                            Button("Import History") { vm.importHistory() }.buttonStyle(.borderedProminent)
+                            Button("Export History") {
+                                vm.exportHistory()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            
+                            Button("Import History") {
+                                vm.importHistory()
+                            }
+                            .buttonStyle(.borderedProminent)
                         }
                     }
                     
                     Divider()
                     
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Clear History").font(.subheadline).fontWeight(.bold)
-                        Button("Clear") { vm.showClearConfirm = true }.foregroundColor(.red)
+                        Text("Clear History")
+                            .font(.subheadline)
+                            .fontWeight(.bold)
+                        
+                        Button("Clear") {
+                            vm.showClearConfirm = true
+                        }
+                        .foregroundColor(.red)
+                        
                         if vm.showClearConfirm {
                             VStack(alignment: .leading, spacing: 8) {
-                                Text("Clear all clipboard items (excluding favorites)?").font(.caption).foregroundColor(.secondary)
+                                Text("Clear all clipboard items (excluding favorites)?")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
                                 HStack {
-                                    Button("Cancel") { vm.showClearConfirm = false }
+                                    Button("Cancel") {
+                                        vm.showClearConfirm = false
+                                    }
                                     Button("Confirm") {
                                         vm.clearNonFavorites()
                                         vm.showClearConfirm = false
-                                    }.foregroundColor(.red)
+                                    }
+                                    .foregroundColor(.red)
                                 }
                             }
                             .padding(8)
@@ -1332,12 +1850,13 @@ struct ClipboardAppView: View {
                         }
                     }
                     
-                    Text("Version v1.6.1")
+                    Text("Version v1.6.3")
                         .font(.caption)
                         .foregroundColor(.gray)
                         .frame(maxWidth: .infinity, alignment: .center)
                     
-                    Spacer().frame(height: 2)
+                    Spacer()
+                        .frame(height: 2)
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 16)
@@ -1357,13 +1876,23 @@ struct ClipboardAppView: View {
             HStack {
                 Text("Preview").font(.headline)
                 Spacer()
-                Button { vm.hidePreview() } label: {
+                Button {
+                    vm.hidePreview()
+                } label: {
                     ZStack {
                         RoundedRectangle(cornerRadius: 5)
-                            .fill(LinearGradient(colors: [Color.blue, Color.purple], startPoint: .topLeading, endPoint: .bottomTrailing))
+                            .fill(LinearGradient(
+                                colors: [Color.blue, Color.purple],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ))
                             .frame(width: 18, height: 18)
-                        Image(systemName: "xmark").font(.system(size: 9, weight: .semibold)).foregroundColor(.white)
-                    }.contentShape(Rectangle())
+                        
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.white)
+                    }
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Close Preview")
@@ -1372,24 +1901,37 @@ struct ClipboardAppView: View {
             if let item = vm.previewItem {
                 if item.isImage, let imageData = item.imageData, let nsImage = NSImage(data: imageData) {
                     VStack(spacing: 8) {
-                        Text("Image Preview").font(.subheadline).fontWeight(.medium)
+                        Text("Image Preview")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        
                         Image(nsImage: nsImage)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
                             .frame(maxWidth: vm.currentDimensions.width * 0.8, maxHeight: vm.currentDimensions.height * 0.4)
                             .border(Color.gray.opacity(0.3), width: 1)
-                        Text("Size: \(Int(nsImage.size.width)) × \(Int(nsImage.size.height))").font(.caption).foregroundColor(.secondary)
+                        
+                        Text("Size: \(Int(nsImage.size.width)) × \(Int(nsImage.size.height))")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
                 } else {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text("Text Preview").font(.subheadline).fontWeight(.medium)
+                            Text("Text Preview")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
                             Spacer()
                             VStack(alignment: .trailing, spacing: 2) {
-                                Text("\(item.content.count) characters").font(.caption).foregroundColor(.secondary)
-                                Text("\(item.content.components(separatedBy: .newlines).count) lines").font(.caption).foregroundColor(.secondary)
+                                Text("\(item.content.count) characters")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text("\(item.content.components(separatedBy: .newlines).count) lines")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
                             }
                         }
+                        
                         ScrollView {
                             if item.content.count > 50000 {
                                 LazyVStack(alignment: .leading, spacing: 4) {
@@ -1397,6 +1939,7 @@ struct ClipboardAppView: View {
                                         let startIndex = chunkIndex * 1000
                                         let endIndex = min(startIndex + 1000, item.content.count)
                                         let chunk = String(item.content[item.content.index(item.content.startIndex, offsetBy: startIndex)..<item.content.index(item.content.startIndex, offsetBy: endIndex)])
+                                        
                                         Text(chunk)
                                             .font(.system(size: 13, design: .monospaced))
                                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1417,11 +1960,20 @@ struct ClipboardAppView: View {
                             }
                         }
                         .frame(maxHeight: vm.currentDimensions.height * 0.5)
+                        
                         HStack {
-                            Button("Copy") { vm.copyFromPreview(item); vm.hidePreview() }
-                                .buttonStyle(.borderedProminent).controlSize(.small)
-                            Button("Close") { vm.hidePreview() }
-                                .buttonStyle(.bordered).controlSize(.small)
+                            Button("Copy") {
+                                vm.copyFromPreview(item)
+                                vm.hidePreview()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            
+                            Button("Close") {
+                                vm.hidePreview()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                         }
                     }
                 }
