@@ -1,22 +1,4 @@
-if !hotkeyManager.isRegistered && !GlobalHotkeyManager.shared.hasAccessibilityPermission() {
-                            HStack {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundColor(.orange)
-                                    .font(.caption)
-                                
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Accessibility permission required")
-                                        .font(.caption)
-                                        .foregroundColor(.orange)
-                                    
-                                    Button("Open System Settings") {
-                                        hotkeyManager.openAccessibilitySettings()
-                                    }
-                                    .font(.caption)
-                                    .buttonStyle(.bordered)
-                                }
-                            }
-                            .padding(8)import SwiftUI
+import SwiftUI
 import AppKit
 import Carbon
 import Foundation
@@ -104,14 +86,14 @@ class MenuBarManager: ObservableObject {
     }
 }
 
-// MARK: - Global Hotkey Manager (Completely Rewritten)
+// MARK: - Global Hotkey Manager (Fixed Permission Handling)
 class GlobalHotkeyManager: ObservableObject {
     static let shared = GlobalHotkeyManager()
     private var hotkeyRefs: [String: EventHotKeyRef] = [:]
     private var isAppVisible = false
     @Published var isRegistered = false
     private var eventHandler: EventHandlerRef?
-    private var permissionChecked = false
+    private static var permissionRequestInProgress = false  // Static to ensure single instance
 
     private init() {
         setupEventHandler()
@@ -224,29 +206,31 @@ class GlobalHotkeyManager: ObservableObject {
         return AXIsProcessTrusted()
     }
     
-    // ONLY REQUEST PERMISSION WHEN EXPLICITLY CALLED
+    // FIXED: Only request permission once at a time
     func requestAccessibilityPermission() -> Bool {
         if hasAccessibilityPermission() {
             return true
         }
         
-        // Only show system prompt once
-        if !permissionChecked {
-            permissionChecked = true
-            let options: [String: Any] = [
-                kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
-            ]
-            let result = AXIsProcessTrustedWithOptions(options as CFDictionary)
-            
-            // Give it a moment to process
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                self.permissionChecked = false // Reset for next time
-            }
-            
-            return result
+        // Prevent multiple simultaneous permission requests
+        guard !Self.permissionRequestInProgress else {
+            print("Permission request already in progress")
+            return false
         }
         
-        return false
+        Self.permissionRequestInProgress = true
+        
+        let options: [String: Any] = [
+            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+        ]
+        let result = AXIsProcessTrustedWithOptions(options as CFDictionary)
+        
+        // Reset flag after a delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            Self.permissionRequestInProgress = false
+        }
+        
+        return result
     }
     
     func registerHotkey(_ keyCombo: String) -> Bool {
@@ -869,18 +853,36 @@ class ClipboardViewModel: ObservableObject {
         
         // Check permission without prompting first
         if !GlobalHotkeyManager.shared.hasAccessibilityPermission() {
-            // Request permission (this will show the system dialog)
-            if !GlobalHotkeyManager.shared.requestAccessibilityPermission() {
-                toast("Accessibility permission required - please grant it and try again")
-                return
-            }
-            
-            // Wait a moment for permission to be processed
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self.attemptHotkeyRegistration(fullCombo: fullCombo)
+            // Only request permission once - prevent double dialog
+            DispatchQueue.main.async {
+                if GlobalHotkeyManager.shared.requestAccessibilityPermission() {
+                    // Permission already granted
+                    self.attemptHotkeyRegistration(fullCombo: fullCombo)
+                } else {
+                    // Permission dialog shown, wait for user action
+                    self.toast("Please grant accessibility permission in System Settings")
+                    
+                    // Check periodically if permission was granted
+                    self.checkPermissionAndRegister(fullCombo: fullCombo, attempts: 0)
+                }
             }
         } else {
             attemptHotkeyRegistration(fullCombo: fullCombo)
+        }
+    }
+    
+    private func checkPermissionAndRegister(fullCombo: String, attempts: Int) {
+        guard attempts < 30 else { // Check for 30 seconds max
+            toast("Permission timeout - please try again")
+            return
+        }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            if GlobalHotkeyManager.shared.hasAccessibilityPermission() {
+                self.attemptHotkeyRegistration(fullCombo: fullCombo)
+            } else {
+                self.checkPermissionAndRegister(fullCombo: fullCombo, attempts: attempts + 1)
+            }
         }
     }
     
@@ -1532,7 +1534,7 @@ struct ClipboardAppView: View {
                                 if !newShortcut.isEmpty {
                                     vm.addShortcut(key: newShortcut, modifier: selectedHotkey)
                                     newShortcut = ""
-                                    selectedHotkey = "None"
+                                    selectedHotkey = "Command (⌘)"
                                 }
                             }
                             .buttonStyle(.borderedProminent)
@@ -1629,7 +1631,7 @@ struct ClipboardAppView: View {
                         }
                     }
                     
-                    Text("Version v1.5.0")
+                    Text("Version v1.5.5")
                         .font(.caption)
                         .foregroundColor(.gray)
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -1772,7 +1774,6 @@ struct ClipboardAppView: View {
 
 // MARK: - Entry Point
 @available(macOS 12.0, *)
-@main
 struct CopyMacApp: App {
     @StateObject private var hotkeyManager = GlobalHotkeyManager.shared
     @StateObject private var menuBarManager = MenuBarManager()
@@ -1799,3 +1800,6 @@ struct CopyMacApp: App {
         }
     }
 }
+
+// Manual entry point - only use if @main doesn't work
+CopyMacApp.main()
