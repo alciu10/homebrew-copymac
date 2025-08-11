@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "copymac-clipboard",
     platforms: [
-        .macOS(.v12)
+        .macOS(.v13)  // Changed from .v12 to .v13
     ],
     products: [
         .executable(name: "copymac-clipboard", targets: ["CopyMacClipboard"])

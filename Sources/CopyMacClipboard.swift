@@ -59,24 +59,137 @@ extension NSWindow {
     }
 }
 
-// MARK: - Menu Bar Manager
-class MenuBarManager: ObservableObject {
-    static let shared = MenuBarManager()
-    private var statusItem: NSStatusItem?
-    @Published var isMenuBarEnabled = false
+// MARK: - String Extension for FourCharCode
+extension String {
+    var fourCharCode: FourCharCode {
+        var result: FourCharCode = 0
+        let utf16 = self.utf16
+        for char in utf16.prefix(4) {
+            result = (result << 8) + FourCharCode(char)
+        }
+        return result
+    }
+}
+
+// MARK: - Accessibility Permission Manager
+class AccessibilityPermissionManager: ObservableObject {
+    @Published var isPermissionGranted: Bool = false
+    @Published var permissionCheckInProgress: Bool = false
     
-    private init() {}
+    init() {
+        checkPermissionStatus()
+    }
+    
+    func checkPermissionStatus() {
+        isPermissionGranted = AXIsProcessTrusted()
+    }
+    
+    func requestPermission() {
+        guard !permissionCheckInProgress else { return }
+        
+        permissionCheckInProgress = true
+        
+        // First check without prompt
+        if AXIsProcessTrusted() {
+            isPermissionGranted = true
+            permissionCheckInProgress = false
+            return
+        }
+        
+        // Show custom alert before prompting system dialog
+        let alert = NSAlert()
+        alert.messageText = "Accessibility Permission Required"
+        alert.informativeText = """
+        CopyMac needs Accessibility permission to register global keyboard shortcuts.
+        
+        After clicking "Grant Permission", you'll be taken to System Settings where you need to:
+        
+        1. Find "CopyMac" in the list
+        2. Toggle the switch to enable it
+        3. Return to CopyMac
+        
+        Would you like to proceed?
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Grant Permission")
+        alert.addButton(withTitle: "Cancel")
+        
+        let response = alert.runModal()
+        
+        if response == .alertFirstButtonReturn {
+            // Use the prompt option to open System Settings
+            let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeRetainedValue() as NSString: true]
+            let _ = AXIsProcessTrustedWithOptions(options)
+            
+            // Start periodic checking
+            startPeriodicPermissionCheck()
+        } else {
+            permissionCheckInProgress = false
+        }
+    }
+    
+    private func startPeriodicPermissionCheck() {
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
+            
+            let currentStatus = AXIsProcessTrusted()
+            
+            DispatchQueue.main.async {
+                if currentStatus != self.isPermissionGranted {
+                    self.isPermissionGranted = currentStatus
+                    
+                    if currentStatus {
+                        // Permission granted, stop checking
+                        timer.invalidate()
+                        self.permissionCheckInProgress = false
+                        
+                        // Show success message
+                        let successAlert = NSAlert()
+                        successAlert.messageText = "Permission Granted!"
+                        successAlert.informativeText = "Accessibility permission has been granted. You can now use global keyboard shortcuts."
+                        successAlert.alertStyle = .informational
+                        successAlert.addButton(withTitle: "OK")
+                        successAlert.runModal()
+                    }
+                }
+            }
+            
+            // Stop checking after 2 minutes to prevent infinite polling
+            if self.permissionCheckInProgress {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 120) {
+                    timer.invalidate()
+                    self.permissionCheckInProgress = false
+                }
+            }
+        }
+    }
+    
+    func openSystemSettings() {
+        // Try multiple URLs for different macOS versions
+        let urls = [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            "x-apple.systempreferences:com.apple.preference.security"
+        ]
+        
+        for urlString in urls {
+            if let url = URL(string: urlString) {
+                if NSWorkspace.shared.open(url) {
+                    break
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Menu Bar Manager (Simplified)
+class MenuBarManager: ObservableObject {
+    private var statusItem: NSStatusItem?
     
     func createMenuBarIcon() {
-        guard statusItem == nil else { return }
-        
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "CopyMac")
-            button.action = #selector(menuBarClicked)
-            button.target = self
-        }
-        isMenuBarEnabled = true
+        return
     }
     
     func removeMenuBarIcon() {
@@ -84,7 +197,6 @@ class MenuBarManager: ObservableObject {
             NSStatusBar.system.removeStatusItem(statusItem)
             self.statusItem = nil
         }
-        isMenuBarEnabled = false
     }
     
     @objc private func menuBarClicked() {
@@ -94,23 +206,19 @@ class MenuBarManager: ObservableObject {
     }
 }
 
-// MARK: - Global Hotkey Manager
+// MARK: - Global Hotkey Manager (Updated)
 class GlobalHotkeyManager: ObservableObject {
     static let shared = GlobalHotkeyManager()
     private var hotkeyRefs: [String: EventHotKeyRef] = [:]
     private var isAppVisible = false
     @Published var isRegistered = false
-    @Published var permissionGranted = false
     private var eventHandler: EventHandlerRef?
-    private static var permissionRequestInProgress = false
-    private var permissionCheckTimer: Timer?
-    
+    private var accessibilityManager = AccessibilityPermissionManager()
+
     private init() {
         setupEventHandler()
-        startPermissionMonitoring()
-        loadPermissionState()
     }
-    
+
     private func setupEventHandler() {
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
@@ -135,7 +243,7 @@ class GlobalHotkeyManager: ObservableObject {
             print("Failed to install event handler: \(result)")
         }
     }
-    
+
     private static func staticEventHandler(nextHandler: EventHandlerCallRef, event: EventRef, userData: UnsafeMutableRawPointer) -> OSStatus {
         let manager = Unmanaged<GlobalHotkeyManager>.fromOpaque(userData).takeUnretainedValue()
         var hotKeyID = EventHotKeyID()
@@ -160,64 +268,7 @@ class GlobalHotkeyManager: ObservableObject {
         }
         return noErr
     }
-    
-    private func startPermissionMonitoring() {
-        permissionCheckTimer?.invalidate()
-        permissionCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.updatePermissionStatus()
-        }
-        RunLoop.current.add(permissionCheckTimer!, forMode: .common)
-        updatePermissionStatus()
-    }
-    
-    private func updatePermissionStatus() {
-        let wasGranted = permissionGranted
-        permissionGranted = AXIsProcessTrusted()
-        
-        if permissionGranted != wasGranted {
-            print("Permission state changed: \(permissionGranted ? "Granted" : "Revoked")")
-            do {
-                try savePermissionState()
-            } catch {
-                print("Failed to save permission state: \(error)")
-            }
-            DispatchQueue.main.async {
-                if self.permissionGranted {
-                    NotificationCenter.default.post(name: NSNotification.Name("AccessibilityPermissionGranted"), object: nil)
-                    ClipboardViewModel.shared.updateGlobalHotkeys()
-                } else {
-                    NotificationCenter.default.post(name: NSNotification.Name("AccessibilityPermissionRevoked"), object: nil)
-                    ClipboardViewModel.shared.updateGlobalHotkeys()
-                }
-            }
-        }
-    }
-    
-    private func savePermissionState() throws {
-        let defaults = UserDefaults.standard
-        defaults.set(permissionGranted, forKey: "AccessibilityPermissionGranted")
-        // Verify write
-        if defaults.bool(forKey: "AccessibilityPermissionGranted") != permissionGranted {
-            throw NSError(domain: "CopyMac", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to save accessibility permission state"])
-        }
-        print("Saved permission state: \(permissionGranted)")
-    }
-    
-    private func loadPermissionState() {
-        let defaults = UserDefaults.standard
-        permissionGranted = defaults.bool(forKey: "AccessibilityPermissionGranted")
-        let systemPermission = AXIsProcessTrusted()
-        if permissionGranted != systemPermission {
-            permissionGranted = systemPermission
-            do {
-                try savePermissionState()
-            } catch {
-                print("Failed to save permission state during load: \(error)")
-            }
-        }
-        print("Loaded permission state: \(permissionGranted)")
-    }
-    
+
     func toggleAppVisibility() {
         DispatchQueue.main.async {
             if self.isAppVisible {
@@ -227,7 +278,7 @@ class GlobalHotkeyManager: ObservableObject {
             }
         }
     }
-    
+
     func showApp() {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -265,42 +316,15 @@ class GlobalHotkeyManager: ObservableObject {
             NSApp.setActivationPolicy(.accessory)
             self.isAppVisible = false
             
+            // Clear any selected/highlighted items when hiding the app
             NotificationCenter.default.post(name: NSNotification.Name("AppWillHide"), object: nil)
         }
     }
     
-    func hasAccessibilityPermission() -> Bool {
-        let isTrusted = AXIsProcessTrusted()
-        print("Checked accessibility permission: \(isTrusted)")
-        return isTrusted
-    }
-    
-    func requestAccessibilityPermission() {
-        guard !Self.permissionRequestInProgress else {
-            print("Permission request already in progress")
-            return
-        }
-        
-        Self.permissionRequestInProgress = true
-        print("Requesting accessibility permission")
-        
-        let options: [String: Any] = [
-            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
-        ]
-        _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
-        
-        // Immediate check after request
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.updatePermissionStatus()
-            Self.permissionRequestInProgress = false
-        }
-    }
-    
     func registerHotkey(_ keyCombo: String) -> Bool {
-        print("Attempting to register hotkey: \(keyCombo)")
-        
-        guard hasAccessibilityPermission() else {
-            print("Hotkey registration failed: No accessibility permission")
+        // Check accessibility permission first
+        guard isAccessibilityEnabled() else {
+            print("Hotkey registration failed: Accessibility permission denied")
             isRegistered = false
             return false
         }
@@ -315,10 +339,9 @@ class GlobalHotkeyManager: ObservableObject {
             print("Hotkey registration failed: \(keyCombo) is a reserved shortcut")
             return false
         }
-        
         if hotkeyRefs[keyCombo] != nil {
-            print("Hotkey already registered: \(keyCombo)")
-            return true
+            print("Hotkey registration failed: \(keyCombo) is already registered")
+            return false
         }
         
         var hotkeyRef: EventHotKeyRef?
@@ -348,15 +371,13 @@ class GlobalHotkeyManager: ObservableObject {
         if let ref = hotkeyRefs[keyCombo] {
             UnregisterEventHotKey(ref)
             hotkeyRefs.removeValue(forKey: keyCombo)
-            print("Unregistered hotkey: \(keyCombo)")
         }
         isRegistered = !hotkeyRefs.isEmpty
     }
     
     func unregisterAllHotkeys() {
-        for (combo, ref) in hotkeyRefs {
+        for (_, ref) in hotkeyRefs {
             UnregisterEventHotKey(ref)
-            print("Unregistered hotkey: \(combo)")
         }
         hotkeyRefs.removeAll()
         isRegistered = false
@@ -382,6 +403,10 @@ class GlobalHotkeyManager: ObservableObject {
         if keyChar.range(of: "⌃") != nil { modifiers |= UInt32(controlKey) }
         if keyChar.range(of: "⌥") != nil { modifiers |= UInt32(optionKey) }
         if keyChar.range(of: "⇪") != nil { modifiers |= 0x10000 }
+        if keyChar.range(of: "🌐") != nil || keyChar.range(of: "fn") != nil {
+            print("Fn key is not supported for hotkey registration")
+            return nil
+        }
         
         let cleanKey = baseKey.uppercased()
         guard let keyCode = charToKeyCode(cleanKey) else {
@@ -411,31 +436,27 @@ class GlobalHotkeyManager: ObservableObject {
         return keyMap[char]
     }
     
-    func openAccessibilitySettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-            print("Opened Accessibility settings")
-        }
+    // MARK: - New Accessibility Permission Functions
+    
+    /// Check if accessibility permission is currently enabled
+    func isAccessibilityEnabled() -> Bool {
+        return AXIsProcessTrusted()
     }
     
+    /// Request accessibility permission with improved user experience
+    func requestAccessibilityPermission() {
+        accessibilityManager.requestPermission()
+    }
+    
+    /// Get the accessibility permission manager for UI binding
+    func getAccessibilityManager() -> AccessibilityPermissionManager {
+        return accessibilityManager
+    }
+
     deinit {
-        permissionCheckTimer?.invalidate()
         if let handler = eventHandler {
             RemoveEventHandler(handler)
         }
-        unregisterAllHotkeys()
-    }
-}
-
-// MARK: - String Extension for FourCharCode
-extension String {
-    var fourCharCode: FourCharCode {
-        var result: FourCharCode = 0
-        let utf16 = self.utf16
-        for char in utf16.prefix(4) {
-            result = (result << 8) + FourCharCode(char)
-        }
-        return result
     }
 }
 
@@ -592,17 +613,10 @@ struct ThemeToggle: View {
 
 // MARK: - ViewModel
 class ClipboardViewModel: ObservableObject {
-    static let shared = ClipboardViewModel()
-    
     @Published var items: [ClipboardItem] = []
     @Published var theme: Theme = .light {
         didSet {
-            do {
-                try saveSettings()
-            } catch {
-                print("Failed to save settings in theme didSet: \(error)")
-                toast("Failed to save theme settings")
-            }
+            saveSettings()
         }
     }
     @Published var appSize: AppSize = .small
@@ -622,17 +636,6 @@ class ClipboardViewModel: ObservableObject {
         }
     }
     @Published var showReturnToTop = false
-    @Published var useMenuBarMode: Bool = false {
-        didSet {
-            do {
-                try saveSettings()
-            } catch {
-                print("Failed to save settings in useMenuBarMode didSet: \(error)")
-                toast("Failed to save menu bar settings")
-            }
-            updateAppMode()
-        }
-    }
     
     private var changeCount = NSPasteboard.general.changeCount
     private let historyKey = "ClipboardHistory"
@@ -649,6 +652,7 @@ class ClipboardViewModel: ObservableObject {
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.pollClipboard()
         }
+        updateGlobalHotkeys()
         
         NotificationCenter.default.addObserver(
             forName: NSNotification.Name("AppWillHide"),
@@ -657,53 +661,6 @@ class ClipboardViewModel: ObservableObject {
         ) { [weak self] _ in
             self?.clearSelectionStates()
         }
-        
-        NotificationCenter.default.addObserver(
-            forName: NSNotification.Name("AccessibilityPermissionGranted"),
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.onPermissionGranted()
-        }
-        
-        NotificationCenter.default.addObserver(
-            forName: NSNotification.Name("AccessibilityPermissionRevoked"),
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.onPermissionRevoked()
-        }
-        
-        // Initial hotkey registration check
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.checkAndRegisterHotkeys()
-        }
-    }
-    
-    private func updateAppMode() {
-        if useMenuBarMode {
-            MenuBarManager.shared.createMenuBarIcon()
-            toast("Menu Bar mode activated")
-        } else {
-            MenuBarManager.shared.removeMenuBarIcon()
-        }
-    }
-    
-    private func checkAndRegisterHotkeys() {
-        if !keyboardShortcuts.isEmpty && GlobalHotkeyManager.shared.hasAccessibilityPermission() {
-            updateGlobalHotkeys()
-        }
-    }
-    
-    private func onPermissionGranted() {
-        print("Permission granted notification received")
-        updateGlobalHotkeys()
-        toast("Accessibility permission granted - shortcuts activated")
-    }
-    
-    private func onPermissionRevoked() {
-        print("Permission revoked notification received")
-        toast("Accessibility permission revoked - shortcuts disabled")
     }
     
     private func clearSelectionStates() {
@@ -722,15 +679,18 @@ class ClipboardViewModel: ObservableObject {
     }
     
     var filteredItems: [ClipboardItem] {
+        // SIMPLE LOGIC - NO COMPLEX SORTING
         let searchLowercased = searchText.lowercased()
         
         if searchText.isEmpty {
+            // Return ALL items, favorites first
             let favorites = items.filter { $0.isFavorite }.sorted { (a, b) in
                 (a.favoritePosition ?? 0) < (b.favoritePosition ?? 0)
             }
             let nonFavorites = items.filter { !$0.isFavorite }.sorted { $0.timestamp > $1.timestamp }
             return favorites + nonFavorites
         } else {
+            // Filter by search
             return items.filter { $0.lowercaseContent.contains(searchLowercased) }
         }
     }
@@ -750,21 +710,25 @@ class ClipboardViewModel: ObservableObject {
     
     func handleNewClipboardContent(content: String = "", imageData: Data? = nil) {
         if !content.isEmpty {
+            // Check if this content already exists
             if items.contains(where: { $0.content == content }) {
-                return
+                return // Don't add duplicates
             }
             insert(content: content, showToast: false)
         } else if imageData != nil {
+            // Check if this image already exists
             if items.contains(where: { $0.isImage && $0.imageData == imageData }) {
-                return
+                return // Don't add duplicates
             }
             insert(imageData: imageData, showToast: false)
         }
     }
     
     func insert(content: String = "", imageData: Data? = nil, isFavorite: Bool = false, showToast: Bool = true) {
+        // DEAD SIMPLE INSERT LOGIC
         let newItem = ClipboardItem(content: content, imageData: imageData, isFavorite: isFavorite)
         
+        // Just add to beginning of array - simple!
         items.insert(newItem, at: 0)
         
         if showToast {
@@ -773,6 +737,7 @@ class ClipboardViewModel: ObservableObject {
         
         saveHistory()
         
+        // Force UI update
         DispatchQueue.main.async {
             self.objectWillChange.send()
         }
@@ -790,6 +755,7 @@ class ClipboardViewModel: ObservableObject {
         selectedItem = item
         toast("Copied")
         
+        // Move copied item to top (under favorites) if it's not a favorite
         if !item.isFavorite {
             moveItemToTop(item)
         }
@@ -811,26 +777,33 @@ class ClipboardViewModel: ObservableObject {
         selectedItem = item
         toast("Copied")
         
+        // Move copied item to top (under favorites) if it's not a favorite
         if !item.isFavorite {
             moveItemToTop(item)
         }
+        
+        // Don't close the app when copying from preview
     }
     
     private func moveItemToTop(_ item: ClipboardItem) {
+        // Find and remove the item from its current position
         if let currentIndex = items.firstIndex(where: { $0.id == item.id }) {
             let itemToMove = items[currentIndex]
             items.remove(at: currentIndex)
             
+            // Insert after all favorites (at the top of non-favorites)
             let favoriteCount = items.filter { $0.isFavorite }.count
             var updatedItem = itemToMove
-            updatedItem.timestamp = Date()
+            updatedItem.timestamp = Date() // Update timestamp to mark as recently used
             items.insert(updatedItem, at: favoriteCount)
             
+            // Save the updated order
             saveHistory()
         }
     }
     
     func showPreviewFor(_ item: ClipboardItem) {
+        // Use async to prevent UI blocking
         DispatchQueue.main.async {
             self.previewItem = item
             self.showPreview = true
@@ -877,6 +850,7 @@ class ClipboardViewModel: ObservableObject {
                 items.insert(updatedItem, at: 0)
             } else {
                 updatedItem.favoritePosition = nil
+                // Insert after all favorites
                 let favoriteCount = items.filter { $0.isFavorite }.count
                 items.insert(updatedItem, at: favoriteCount)
             }
@@ -930,14 +904,6 @@ class ClipboardViewModel: ObservableObject {
     }
     
     func addShortcut(key: String, modifier: String) {
-        print("Adding shortcut - key: '\(key)', modifier: '\(modifier)'")
-        
-        if modifier == "None" {
-            print("No modifier selected - Carbon requires at least one modifier")
-            toast("Please select a modifier key (⌘, ⌥, ⌃, or ⇧)")
-            return
-        }
-        
         let modifierMap: [String: String] = [
             "Command (⌘)": "⌘",
             "Option (⌥)": "⌥",
@@ -952,100 +918,32 @@ class ClipboardViewModel: ObservableObject {
             "Right Arrow (→)": "→"
         ]
         
-        let fullCombo = (modifierMap[modifier] ?? "") + key
-        print("Full combo created: '\(fullCombo)'")
-        
+        let fullCombo = modifier == "None" ? key : (modifierMap[modifier] ?? "") + key
         if keyboardShortcuts.contains(where: { $0.combo == fullCombo }) {
-            print("Shortcut already exists: \(fullCombo)")
             toast("Shortcut already exists")
             return
         }
         
-        // Save the shortcut
-        keyboardShortcuts.append(KeyboardShortcut(combo: fullCombo))
-        do {
-            try saveSettings()
-        } catch {
-            print("Failed to save settings: \(error)")
-            toast("Failed to save shortcut - check storage permissions")
-            keyboardShortcuts.removeAll { $0.combo == fullCombo }
-            return
-        }
-        
-        // Attempt registration
-        if GlobalHotkeyManager.shared.hasAccessibilityPermission() {
-            attemptHotkeyRegistration(fullCombo: fullCombo)
-        } else {
-            print("No accessibility permission - requesting...")
-            toast("Please grant accessibility permission in System Settings to activate shortcuts")
-            GlobalHotkeyManager.shared.requestAccessibilityPermission()
-        }
-    }
-    
-    private func attemptHotkeyRegistration(fullCombo: String) {
         if GlobalHotkeyManager.shared.registerHotkey(fullCombo) {
-            print("Shortcut registered successfully: \(fullCombo)")
-            toast("Shortcut registered: \(fullCombo)")
+            keyboardShortcuts.append(KeyboardShortcut(combo: fullCombo))
+            saveSettings()
+            toast("Shortcut added")
         } else {
-            print("Failed to register shortcut: \(fullCombo)")
-            toast("Failed to register shortcut - try a different combination")
-            keyboardShortcuts.removeAll { $0.combo == fullCombo }
-            do {
-                try saveSettings()
-            } catch {
-                print("Failed to save settings after removing failed shortcut: \(error)")
-            }
+            toast("Invalid or reserved shortcut")
         }
     }
     
     func removeShortcut(_ shortcut: String) {
         keyboardShortcuts.removeAll { $0.combo == shortcut }
         GlobalHotkeyManager.shared.unregisterHotkey(shortcut)
-        do {
-            try saveSettings()
-        } catch {
-            print("Failed to save settings after removing shortcut: \(error)")
-            toast("Failed to save settings - check storage permissions")
-        }
+        saveSettings()
         toast("Shortcut removed")
     }
     
     func updateGlobalHotkeys() {
-        print("Updating all global hotkeys")
         GlobalHotkeyManager.shared.unregisterAllHotkeys()
-        
-        guard GlobalHotkeyManager.shared.hasAccessibilityPermission() else {
-            print("Cannot register hotkeys: No accessibility permission")
-            toast("Accessibility permission required for shortcuts")
-            return
-        }
-        
-        var successCount = 0
-        var failedShortcuts: [String] = []
-        
         for shortcut in keyboardShortcuts {
-            if GlobalHotkeyManager.shared.registerHotkey(shortcut.combo) {
-                successCount += 1
-                print("Registered shortcut: \(shortcut.combo)")
-            } else {
-                print("Failed to register: \(shortcut.combo)")
-                failedShortcuts.append(shortcut.combo)
-            }
-        }
-        
-        // Remove failed shortcuts
-        keyboardShortcuts.removeAll { failedShortcuts.contains($0.combo) }
-        do {
-            try saveSettings()
-        } catch {
-            print("Failed to save settings after updating hotkeys: \(error)")
-            toast("Failed to save shortcut settings")
-        }
-        
-        if successCount > 0 {
-            toast("\(successCount) shortcut(s) activated")
-        } else if !keyboardShortcuts.isEmpty {
-            toast("Failed to register shortcuts - try different combinations")
+            _ = GlobalHotkeyManager.shared.registerHotkey(shortcut.combo)
         }
     }
     
@@ -1056,7 +954,7 @@ class ClipboardViewModel: ObservableObject {
             }
             
             let prefix = item.isFavorite ? "[FAVORITE] " : ""
-            return prefix + item.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            return prefix + item.content.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         }.filter { !$0.isEmpty }
         
         let exportContent = textItems.joined(separator: "\n---\n")
@@ -1069,7 +967,7 @@ class ClipboardViewModel: ObservableObject {
         savePanel.begin { response in
             if response == .OK, let url = savePanel.url {
                 do {
-                    try exportContent.write(to: url, atomically: true, encoding: .utf8)
+                    try exportContent.write(to: url, atomically: true, encoding: String.Encoding.utf8)
                     DispatchQueue.main.async {
                         self.toast("Exported \(textItems.count) items")
                     }
@@ -1091,7 +989,7 @@ class ClipboardViewModel: ObservableObject {
         openPanel.begin { response in
             if response == .OK, let url = openPanel.url {
                 do {
-                    let fileContent = try String(contentsOf: url, encoding: .utf8)
+                    let fileContent = try String(contentsOf: url, encoding: String.Encoding.utf8)
                     DispatchQueue.main.async {
                         self.processImportedText(fileContent)
                     }
@@ -1106,7 +1004,7 @@ class ClipboardViewModel: ObservableObject {
     
     private func processImportedText(_ text: String) {
         let entries = text.components(separatedBy: "\n---\n")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         
         var importedItems: [ClipboardItem] = []
@@ -1145,23 +1043,14 @@ class ClipboardViewModel: ObservableObject {
     func toast(_ text: String) {
         toastText = text
         showToast = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
             self.showToast = false
         }
     }
     
     private func saveHistory() {
-        do {
-            if let data = try? JSONEncoder().encode(items) {
-                UserDefaults.standard.set(data, forKey: historyKey)
-                if UserDefaults.standard.data(forKey: historyKey) == nil {
-                    throw NSError(domain: "CopyMac", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to save clipboard history"])
-                }
-                print("Saved clipboard history")
-            }
-        } catch {
-            print("Failed to save history: \(error)")
-            toast("Failed to save clipboard history")
+        if let data = try? JSONEncoder().encode(items) {
+            UserDefaults.standard.set(data, forKey: historyKey)
         }
     }
     
@@ -1169,44 +1058,27 @@ class ClipboardViewModel: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: historyKey),
            let savedItems = try? JSONDecoder().decode([ClipboardItem].self, from: data) {
             items = savedItems
-            print("Loaded clipboard history: \(items.count) items")
         }
     }
     
-    private func saveSettings() throws {
-        let defaults = UserDefaults.standard
+    private func saveSettings() {
         if let shortcutData = try? JSONEncoder().encode(keyboardShortcuts) {
-            defaults.set(shortcutData, forKey: "KeyboardShortcuts")
-            if defaults.data(forKey: "KeyboardShortcuts") == nil {
-                throw NSError(domain: "CopyMac", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to save keyboard shortcuts"])
-            }
+            UserDefaults.standard.set(shortcutData, forKey: "KeyboardShortcuts")
         }
         if let themeData = try? JSONEncoder().encode(theme) {
-            defaults.set(themeData, forKey: "AppTheme")
-            if defaults.data(forKey: "AppTheme") == nil {
-                throw NSError(domain: "CopyMac", code: -4, userInfo: [NSLocalizedDescriptionKey: "Failed to save theme settings"])
-            }
+            UserDefaults.standard.set(themeData, forKey: "AppTheme")
         }
-        defaults.set(useMenuBarMode, forKey: "UseMenuBarMode")
-        print("Saved settings: \(keyboardShortcuts.count) shortcuts, theme: \(theme.rawValue), menuBar: \(useMenuBarMode)")
     }
     
     private func loadSettings() {
         if let shortcutData = UserDefaults.standard.data(forKey: "KeyboardShortcuts"),
            let savedShortcuts = try? JSONDecoder().decode([KeyboardShortcut].self, from: shortcutData) {
             keyboardShortcuts = savedShortcuts
-            print("Loaded \(keyboardShortcuts.count) shortcuts")
         }
         
         if let themeData = UserDefaults.standard.data(forKey: "AppTheme"),
            let savedTheme = try? JSONDecoder().decode(Theme.self, from: themeData) {
             theme = savedTheme
-            print("Loaded theme: \(theme.rawValue)")
-        }
-        
-        useMenuBarMode = UserDefaults.standard.bool(forKey: "UseMenuBarMode")
-        if useMenuBarMode {
-            updateAppMode()
         }
     }
 }
@@ -1214,15 +1086,17 @@ class ClipboardViewModel: ObservableObject {
 // MARK: - Main View
 @available(macOS 12.0, *)
 struct ClipboardAppView: View {
-    @StateObject var vm = ClipboardViewModel.shared
+    @StateObject var vm = ClipboardViewModel()
     @StateObject private var hotkeyManager = GlobalHotkeyManager.shared
-    @StateObject private var menuBarManager = MenuBarManager.shared
+    @StateObject private var menuBarManager = MenuBarManager()
+    @StateObject private var accessibilityManager = AccessibilityPermissionManager()
     @State private var newShortcut: String = ""
-    @State private var selectedHotkey: String = "Command (⌘)"
+    @State private var selectedHotkey: String = "None"
     @State private var manualText: String = ""
     @State private var addToFavorites: Bool = false
     
     private let availableHotkeys = [
+        "None",
         "Command (⌘)",
         "Option (⌥)",
         "Control (⌃)",
@@ -1254,14 +1128,10 @@ struct ClipboardAppView: View {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    if !vm.keyboardShortcuts.isEmpty && hotkeyManager.hasAccessibilityPermission() {
-                        vm.updateGlobalHotkeys()
-                    }
-                }
-            }
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                if !vm.keyboardShortcuts.isEmpty && hotkeyManager.hasAccessibilityPermission() && !hotkeyManager.isRegistered {
+                // Check accessibility permission on app start
+                accessibilityManager.checkPermissionStatus()
+                
+                if accessibilityManager.isPermissionGranted && !vm.keyboardShortcuts.isEmpty {
                     vm.updateGlobalHotkeys()
                 }
             }
@@ -1312,6 +1182,7 @@ struct ClipboardAppView: View {
             
             Spacer()
             
+            // Return to Top Button with app icon styling (smaller)
             Button(action: {
                 NotificationCenter.default.post(name: NSNotification.Name("ScrollToTop"), object: nil)
             }) {
@@ -1373,6 +1244,7 @@ struct ClipboardAppView: View {
                             .padding(.top, 60)
                             .id("topAnchor")
                         } else {
+                            // Top anchor for scrolling
                             Color.clear
                                 .frame(height: 1)
                                 .id("topAnchor")
@@ -1451,6 +1323,7 @@ struct ClipboardAppView: View {
     
     func textContent(item: ClipboardItem) -> some View {
         HStack {
+            // Optimize long text display in list by truncating for display only
             let displayText = item.content.count > 500 ?
                 String(item.content.prefix(500)) + "..." :
                 item.content
@@ -1554,312 +1427,34 @@ struct ClipboardAppView: View {
     
     var settingsPanel: some View {
         VStack(spacing: 0) {
-            VStack(spacing: 16) {
-                HStack {
-                    Text("Settings").font(.headline)
-                    Spacer()
-                    Button {
-                        vm.showSettings = false
-                    } label: {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 5)
-                                .fill(LinearGradient(
-                                    colors: [Color.blue, Color.purple],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                ))
-                                .frame(width: 18, height: 18)
-                            
-                            Image(systemName: "xmark")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(.white)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Close Settings")
+            // Header
+            HStack {
+                Text("Settings").font(.headline)
+                Spacer()
+                Button("Close") {
+                    vm.showSettings = false
                 }
+                .buttonStyle(.borderedProminent)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 16)
-            .padding(.bottom, 8)
-            .background(Color(.windowBackgroundColor))
+            .padding()
             
             Divider()
             
+            // Content
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    // Access Mode Section
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Access Mode")
-                            .font(.subheadline)
-                            .fontWeight(.bold)
-                        
-                        VStack(alignment: .leading, spacing: 8) {
-                            // Menu Bar Mode
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundColor(.green)
-                                            .font(.caption)
-                                        Text("Menu Bar Mode")
-                                            .font(.caption)
-                                            .fontWeight(.medium)
-                                        Text("(No permission needed)")
-                                            .font(.caption2)
-                                            .foregroundColor(.green)
-                                    }
-                                    Text("Click menu bar icon to open")
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                }
-                                Spacer()
-                                Toggle("", isOn: $vm.useMenuBarMode)
-                                    .labelsHidden()
-                            }
-                            .padding(8)
-                            .background(Color.green.opacity(0.1))
-                            .cornerRadius(6)
-                        }
-                    }
+                VStack(alignment: .leading, spacing: 20) {
+                    manualEntrySection
+                    globalShortcutsSection
+                    themeSection
+                    importExportSection
+                    clearHistorySection
                     
-                    Divider()
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Add Manual Entry")
-                            .font(.subheadline)
-                            .fontWeight(.bold)
-                        
-                        HStack(spacing: 8) {
-                            TextField("Type your text here", text: $manualText)
-                                .textFieldStyle(.plain)
-                                .padding(.vertical, 8)
-                                .padding(.horizontal, 12)
-                                .background(Color(NSColor.controlBackgroundColor))
-                                .cornerRadius(8)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(manualText.isEmpty ? Color.clear : Color.blue, lineWidth: 2)
-                                )
-                            
-                            Button("Add") {
-                                if !manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                    vm.insert(content: manualText, isFavorite: addToFavorites, showToast: true)
-                                    manualText = ""
-                                    addToFavorites = false
-                                }
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        }
-                        
-                        Toggle("Add to favorites", isOn: $addToFavorites)
-                            .font(.caption)
-                    }
-                    
-                    Divider()
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Global Shortcuts")
-                                .font(.subheadline)
-                                .fontWeight(.bold)
-                            
-                            Spacer()
-                            
-                            HStack(spacing: 4) {
-                                Circle()
-                                    .fill(hotkeyManager.isRegistered ? Color.green : Color.red)
-                                    .frame(width: 6, height: 6)
-                                Text(hotkeyManager.isRegistered ? "Active" : "Inactive")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        
-                        if !hotkeyManager.permissionGranted {
-                            HStack {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundColor(.orange)
-                                    .font(.caption)
-                                
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Accessibility permission required for shortcuts")
-                                        .font(.caption)
-                                        .foregroundColor(.orange)
-                                    
-                                    HStack {
-                                        Button("Open System Settings") {
-                                            hotkeyManager.openAccessibilitySettings()
-                                            hotkeyManager.requestAccessibilityPermission()
-                                        }
-                                        .font(.caption)
-                                        .buttonStyle(.borderedProminent)
-                                        
-                                        Button("Check Permission") {
-                                            if hotkeyManager.hasAccessibilityPermission() {
-                                                vm.updateGlobalHotkeys()
-                                                vm.toast("Permission granted - shortcuts activated")
-                                            } else {
-                                                vm.toast("Permission not granted - please enable in System Settings")
-                                            }
-                                        }
-                                        .font(.caption)
-                                        .buttonStyle(.bordered)
-                                    }
-                                }
-                            }
-                            .padding(8)
-                            .background(Color.orange.opacity(0.1))
-                            .cornerRadius(8)
-                        } else if !hotkeyManager.isRegistered && !vm.keyboardShortcuts.isEmpty {
-                            HStack {
-                                Text("Permission granted but shortcuts not active")
-                                    .font(.caption)
-                                    .foregroundColor(.orange)
-                                
-                                Button("Activate Shortcuts") {
-                                    vm.updateGlobalHotkeys()
-                                }
-                                .font(.caption)
-                                .buttonStyle(.borderedProminent)
-                            }
-                            .padding(8)
-                            .background(Color.orange.opacity(0.1))
-                            .cornerRadius(8)
-                        }
-                        
-                        ForEach(vm.keyboardShortcuts) { shortcut in
-                            HStack {
-                                Text(shortcut.combo)
-                                    .font(.system(size: 13, design: .monospaced))
-                                    .padding(6)
-                                    .background(Color(NSColor.controlBackgroundColor))
-                                    .cornerRadius(4)
-                                
-                                Spacer()
-                                
-                                Button {
-                                    vm.removeShortcut(shortcut.combo)
-                                } label: {
-                                    Image(systemName: "minus.circle.fill")
-                                        .foregroundColor(.red)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Add New Shortcut")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            
-                            HStack {
-                                TextField("e.g., ` or §", text: $newShortcut)
-                                    .textFieldStyle(.plain)
-                                    .padding(.vertical, 6)
-                                    .padding(.horizontal, 8)
-                                    .background(Color(NSColor.controlBackgroundColor))
-                                    .cornerRadius(8)
-                                
-                                Picker("", selection: $selectedHotkey) {
-                                    ForEach(availableHotkeys, id: \.self) { hotkey in
-                                        Text(hotkey).tag(hotkey)
-                                    }
-                                }
-                                .pickerStyle(.menu)
-                                .frame(width: 150)
-                            }
-                            
-                            Button("Add") {
-                                if !newShortcut.isEmpty {
-                                    vm.addShortcut(key: newShortcut, modifier: selectedHotkey)
-                                    newShortcut = ""
-                                    selectedHotkey = "Command (⌘)"
-                                }
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(newShortcut.isEmpty)
-                        }
-                        .padding(.top, 8)
-                    }
-                    
-                    Divider()
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Theme")
-                            .font(.subheadline)
-                            .fontWeight(.bold)
-                        
-                        ThemeToggle(theme: $vm.theme)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    
-                    Divider()
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Import/Export")
-                            .font(.subheadline)
-                            .fontWeight(.bold)
-                        
-                        HStack(spacing: 12) {
-                            Button("Export History") {
-                                vm.exportHistory()
-                            }
-                            .buttonStyle(.borderedProminent)
-                            
-                            Button("Import History") {
-                                vm.importHistory()
-                            }
-                            .buttonStyle(.borderedProminent)
-                        }
-                    }
-                    
-                    Divider()
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Clear History")
-                            .font(.subheadline)
-                            .fontWeight(.bold)
-                        
-                        Button("Clear") {
-                            vm.showClearConfirm = true
-                        }
-                        .foregroundColor(.red)
-                        
-                        if vm.showClearConfirm {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Clear all clipboard items (excluding favorites)?")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                HStack {
-                                    Button("Cancel") {
-                                        vm.showClearConfirm = false
-                                    }
-                                    Button("Confirm") {
-                                        vm.clearNonFavorites()
-                                        vm.showClearConfirm = false
-                                    }
-                                    .foregroundColor(.red)
-                                }
-                            }
-                            .padding(8)
-                            .background(Color(NSColor.controlBackgroundColor))
-                            .cornerRadius(6)
-                        }
-                    }
-                    
-                    Text("Version v1.6.3")
+                    Text("Version v1.6.5")
                         .font(.caption)
                         .foregroundColor(.gray)
                         .frame(maxWidth: .infinity, alignment: .center)
-                    
-                    Spacer()
-                        .frame(height: 2)
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 16)
+                .padding()
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1867,8 +1462,193 @@ struct ClipboardAppView: View {
         .cornerRadius(12)
         .shadow(radius: 10)
         .padding()
-        .focusable(false)
-        .allowsHitTesting(true)
+    }
+    
+    var manualEntrySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Add Manual Entry")
+                .font(.subheadline)
+                .fontWeight(.bold)
+            
+            HStack(spacing: 8) {
+                TextField("Type your text here", text: $manualText)
+                    .textFieldStyle(.roundedBorder)
+                
+                Button("Add") {
+                    if !manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        vm.insert(content: manualText, isFavorite: addToFavorites, showToast: true)
+                        manualText = ""
+                        addToFavorites = false
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            
+            Toggle("Add to favorites", isOn: $addToFavorites)
+                .font(.caption)
+        }
+    }
+    
+    var globalShortcutsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Global Shortcuts")
+                    .font(.subheadline)
+                    .fontWeight(.bold)
+                
+                Spacer()
+                
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(accessibilityManager.isPermissionGranted ? Color.green : Color.red)
+                        .frame(width: 6, height: 6)
+                    Text(accessibilityManager.isPermissionGranted ? "Active" : "Inactive")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            
+            ForEach(Array(vm.keyboardShortcuts.enumerated()), id: \.element.id) { index, shortcut in
+                HStack {
+                    Text(shortcut.combo)
+                        .font(.system(size: 13, design: .monospaced))
+                        .padding(6)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(4)
+                    
+                    Spacer()
+                    
+                    Button("Remove") {
+                        vm.removeShortcut(shortcut.combo)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+            
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Add New Shortcut")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                
+                HStack {
+                    TextField("e.g., ` or §", text: $newShortcut)
+                        .textFieldStyle(.roundedBorder)
+                    
+                    Picker("Modifier", selection: $selectedHotkey) {
+                        ForEach(availableHotkeys, id: \.self) { hotkey in
+                            Text(hotkey).tag(hotkey)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 150)
+                }
+                
+                Button("Add Shortcut") {
+                    if !newShortcut.isEmpty {
+                        vm.addShortcut(key: newShortcut, modifier: selectedHotkey)
+                        newShortcut = ""
+                        selectedHotkey = "None"
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(newShortcut.isEmpty)
+            }
+            
+            if !accessibilityManager.isPermissionGranted {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        Text("Accessibility permission required")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
+                    
+                    Button("Grant Permission") {
+                        accessibilityManager.requestPermission()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(accessibilityManager.permissionCheckInProgress)
+                    
+                    if accessibilityManager.permissionCheckInProgress {
+                        HStack {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                            Text("Waiting for permission...")
+                                .font(.caption2)
+                        }
+                    }
+                }
+                .padding(8)
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(8)
+            }
+        }
+    }
+    
+    var themeSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Theme")
+                .font(.subheadline)
+                .fontWeight(.bold)
+            
+            ThemeToggle(theme: $vm.theme)
+        }
+    }
+    
+    var importExportSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Import/Export")
+                .font(.subheadline)
+                .fontWeight(.bold)
+            
+            HStack(spacing: 12) {
+                Button("Export History") {
+                    vm.exportHistory()
+                }
+                .buttonStyle(.borderedProminent)
+                
+                Button("Import History") {
+                    vm.importHistory()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+    }
+    
+    var clearHistorySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Clear History")
+                .font(.subheadline)
+                .fontWeight(.bold)
+            
+            Button("Clear Non-Favorites") {
+                vm.showClearConfirm = true
+            }
+            .foregroundColor(.red)
+            
+            if vm.showClearConfirm {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Clear all clipboard items (excluding favorites)?")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    HStack {
+                        Button("Cancel") {
+                            vm.showClearConfirm = false
+                        }
+                        Button("Confirm") {
+                            vm.clearNonFavorites()
+                            vm.showClearConfirm = false
+                        }
+                        .foregroundColor(.red)
+                    }
+                }
+                .padding(8)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(6)
+            }
+        }
     }
     
     var previewPanel: some View {
@@ -1932,8 +1712,10 @@ struct ClipboardAppView: View {
                             }
                         }
                         
+                        // Optimized text display with chunking for very long content
                         ScrollView {
                             if item.content.count > 50000 {
+                                // For very long text, use chunked loading
                                 LazyVStack(alignment: .leading, spacing: 4) {
                                     ForEach(0..<min(50, item.content.count / 1000), id: \.self) { chunkIndex in
                                         let startIndex = chunkIndex * 1000
@@ -1950,6 +1732,7 @@ struct ClipboardAppView: View {
                                 .background(Color(NSColor.controlBackgroundColor))
                                 .cornerRadius(6)
                             } else {
+                                // For normal text, use regular display
                                 Text(item.content)
                                     .font(.system(size: 13))
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1990,9 +1773,10 @@ struct ClipboardAppView: View {
 
 // MARK: - Entry Point
 @available(macOS 12.0, *)
+@main
 struct CopyMacApp: App {
     @StateObject private var hotkeyManager = GlobalHotkeyManager.shared
-    @StateObject private var menuBarManager = MenuBarManager.shared
+    @StateObject private var menuBarManager = MenuBarManager()
     
     var body: some Scene {
         WindowGroup {
@@ -2016,6 +1800,3 @@ struct CopyMacApp: App {
         }
     }
 }
-
-// Manual entry point - only use if @main doesn't work
-CopyMacApp.main()
