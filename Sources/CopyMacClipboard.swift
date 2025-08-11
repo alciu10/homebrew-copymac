@@ -46,27 +46,31 @@ extension NSWindow {
         )
         
         if animated {
-            withAnimation(.easeInOut(duration: 0.3)) {
+            withAnimation(.spring(response: 0.2, dampingFraction: 0.95)) {
                 self.setFrame(newFrame, display: true)
-                self.minSize = NSSize(width: 250, height: 400)
+                self.minSize = NSSize(width: 280, height: 380)
                 self.makeKeyAndOrderFront(nil)
             }
         } else {
             self.setFrame(newFrame, display: true)
-            self.minSize = NSSize(width: 250, height: 400)
+            self.minSize = NSSize(width: 280, height: 380)
             self.makeKeyAndOrderFront(nil)
         }
     }
 }
 
-// MARK: - Menu Bar Manager (Disabled)
+// MARK: - Menu Bar Manager
 class MenuBarManager: ObservableObject {
     private var statusItem: NSStatusItem?
     
     func createMenuBarIcon() {
-        // Menu bar icon creation disabled
-        // The function is kept for compatibility but does nothing
-        return
+        // TODO: Implement menu bar icon creation
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem?.button {
+            button.image = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "CopyMac")
+            button.action = #selector(menuBarClicked)
+            button.target = self
+        }
     }
     
     func removeMenuBarIcon() {
@@ -394,9 +398,9 @@ enum AppSize: String, CaseIterable, Codable {
     var dimensions: (width: CGFloat, height: CGFloat) {
         switch self {
         case .small:
-            return (370, 370)
+            return (340, 340)
         case .large:
-            return (388, 500)
+            return (340, 460)
         }
     }
 }
@@ -437,7 +441,6 @@ struct ThemeToggle: View {
                 .overlay(
                     HStack {
                         if theme == .dark {
-                            // Dark mode - moon on the right
                             Spacer()
                             
                             Image(systemName: "moon.fill")
@@ -445,7 +448,6 @@ struct ThemeToggle: View {
                                 .foregroundColor(.yellow)
                                 .padding(.trailing, 12)
                         } else {
-                            // Light mode - sun on the left
                             Image(systemName: "sun.max.fill")
                                 .font(.system(size: 16, weight: .medium))
                                 .foregroundColor(.yellow)
@@ -488,7 +490,6 @@ class ClipboardViewModel: ObservableObject {
     
     private var changeCount = NSPasteboard.general.changeCount
     private let historyKey = "ClipboardHistory"
-    private let maxHistorySize = 100
     private var searchWorkItem: DispatchWorkItem?
     
     var currentDimensions: (width: CGFloat, height: CGFloat) {
@@ -502,6 +503,20 @@ class ClipboardViewModel: ObservableObject {
             self?.pollClipboard()
         }
         updateGlobalHotkeys()
+        
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("AppWillHide"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.clearSelectionStates()
+        }
+    }
+    
+    private func clearSelectionStates() {
+        selectedItem = nil
+        highlightedItem = nil
+        clickCount.removeAll()
     }
     
     private func debounceSearch() {
@@ -576,14 +591,6 @@ class ClipboardViewModel: ObservableObject {
         } else if imageData != nil {
             insert(imageData: imageData, showToast: false)
         }
-        
-        while items.count > maxHistorySize {
-            if let lastNonFavoriteIndex = items.lastIndex(where: { !$0.isFavorite }) {
-                items.remove(at: lastNonFavoriteIndex)
-            } else {
-                break
-            }
-        }
     }
     
     func insert(content: String = "", imageData: Data? = nil, isFavorite: Bool = false, showToast: Bool = true) {
@@ -598,9 +605,13 @@ class ClipboardViewModel: ObservableObject {
             items.insert(newItem, at: insertionIndex)
         }
         
-        // Don't show toast here - let the caller handle it for manual entries
-        if showToast && content.isEmpty && imageData != nil {
-            toast("Added")
+        if showToast {
+            if !content.isEmpty {
+                let toastMessage = isFavorite ? "Favorite Entry Added" : "Entry Added"
+                toast(toastMessage)
+            } else if imageData != nil {
+                toast("Added")
+            }
         }
         saveHistory()
     }
@@ -615,12 +626,11 @@ class ClipboardViewModel: ObservableObject {
         }
         
         selectedItem = item
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.selectedItem = nil
-        }
-        
         toast("Copied")
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            GlobalHotkeyManager.shared.hideApp()
+        }
     }
     
     func showPreviewFor(_ item: ClipboardItem) {
@@ -639,17 +649,18 @@ class ClipboardViewModel: ObservableObject {
         let currentCount = clickCount[item.id] ?? 0
         clickCount[item.id] = currentCount + 1
         
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             self.clickCount[item.id] = 0
         }
         
         if clickCount[item.id] == 2 {
             copy(item)
             clickCount[item.id] = 0
-            
-            // Hide the app after copying
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                GlobalHotkeyManager.shared.hideApp()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                if self.clickCount[item.id] == 0 {
+                    self.highlightedItem = nil
+                }
             }
         }
     }
@@ -684,7 +695,51 @@ class ClipboardViewModel: ObservableObject {
         saveHistory()
     }
     
+    func moveFavoriteUp(_ item: ClipboardItem) {
+        guard item.isFavorite, let currentIndex = items.firstIndex(of: item) else { return }
+        
+        let favoritesBeforeCurrent = items[..<currentIndex].filter { $0.isFavorite }
+        guard let targetItem = favoritesBeforeCurrent.last,
+              let targetIndex = items.firstIndex(of: targetItem) else { return }
+        
+        items.swapAt(currentIndex, targetIndex)
+        updateFavoritePositions()
+        saveHistory()
+        toast("Moved up")
+    }
+    
+    func moveFavoriteDown(_ item: ClipboardItem) {
+        guard item.isFavorite, let currentIndex = items.firstIndex(of: item) else { return }
+        
+        let favoritesAfterCurrent = items[(currentIndex + 1)...].filter { $0.isFavorite }
+        guard let targetItem = favoritesAfterCurrent.first,
+              let targetIndex = items.firstIndex(of: targetItem) else { return }
+        
+        items.swapAt(currentIndex, targetIndex)
+        updateFavoritePositions()
+        saveHistory()
+        toast("Moved down")
+    }
+    
+    private func updateFavoritePositions() {
+        let favoriteItems = items.filter { $0.isFavorite }
+        for (index, item) in favoriteItems.enumerated() {
+            if let itemIndex = items.firstIndex(where: { $0.id == item.id }) {
+                items[itemIndex].favoritePosition = index
+            }
+        }
+    }
+    
     func addShortcut(key: String, modifier: String) {
+        print("Adding shortcut - key: '\(key)', modifier: '\(modifier)'")
+        
+        // Require at least one modifier for Carbon RegisterEventHotKey
+        if modifier == "None" {
+            print("No modifier selected - Carbon requires at least one modifier")
+            toast("Please select a modifier key (⌘, ⌥, ⌃, or ⇧)")
+            return
+        }
+        
         let modifierMap: [String: String] = [
             "Command (⌘)": "⌘",
             "Option (⌥)": "⌥",
@@ -699,8 +754,11 @@ class ClipboardViewModel: ObservableObject {
             "Right Arrow (→)": "→"
         ]
         
-        let fullCombo = modifier == "None" ? key : (modifierMap[modifier] ?? "") + key
+        let fullCombo = (modifierMap[modifier] ?? "") + key
+        print("Full combo created: '\(fullCombo)'")
+        
         if keyboardShortcuts.contains(where: { $0.combo == fullCombo }) {
+            print("Shortcut already exists: \(fullCombo)")
             toast("Shortcut already exists")
             return
         }
@@ -708,13 +766,16 @@ class ClipboardViewModel: ObservableObject {
         if GlobalHotkeyManager.shared.registerHotkey(fullCombo) {
             keyboardShortcuts.append(KeyboardShortcut(combo: fullCombo))
             saveSettings()
-            toast("Shortcut added")
+            print("Shortcut added successfully: \(fullCombo)")
+            toast("Shortcut added: \(fullCombo)")
         } else {
-            toast("Invalid or reserved shortcut")
+            print("Failed to register shortcut: \(fullCombo)")
+            toast("Failed to register shortcut - try a different combination")
         }
     }
     
     func removeShortcut(_ shortcut: String) {
+        print("Removing shortcut: \(shortcut)")
         keyboardShortcuts.removeAll { $0.combo == shortcut }
         GlobalHotkeyManager.shared.unregisterHotkey(shortcut)
         saveSettings()
@@ -722,9 +783,14 @@ class ClipboardViewModel: ObservableObject {
     }
     
     func updateGlobalHotkeys() {
+        print("Updating all global hotkeys")
         GlobalHotkeyManager.shared.unregisterAllHotkeys()
-        for shortcut in keyboardShortcuts {
-            _ = GlobalHotkeyManager.shared.registerHotkey(shortcut.combo)
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            for shortcut in self.keyboardShortcuts {
+                let success = GlobalHotkeyManager.shared.registerHotkey(shortcut.combo)
+                print("Re-registering shortcut \(shortcut.combo): \(success ? "success" : "failed")")
+            }
         }
     }
     
@@ -817,14 +883,6 @@ class ClipboardViewModel: ObservableObject {
             }
         }
         
-        while items.count > maxHistorySize {
-            if let lastNonFavoriteIndex = items.lastIndex(where: { !$0.isFavorite }) {
-                items.remove(at: lastNonFavoriteIndex)
-            } else {
-                break
-            }
-        }
-        
         saveHistory()
         toast("Imported \(importedItems.count) items")
     }
@@ -854,9 +912,6 @@ class ClipboardViewModel: ObservableObject {
         if let shortcutData = try? JSONEncoder().encode(keyboardShortcuts) {
             UserDefaults.standard.set(shortcutData, forKey: "KeyboardShortcuts")
         }
-        if let appSizeData = try? JSONEncoder().encode(appSize) {
-            UserDefaults.standard.set(appSizeData, forKey: "AppSize")
-        }
         if let themeData = try? JSONEncoder().encode(theme) {
             UserDefaults.standard.set(themeData, forKey: "AppTheme")
         }
@@ -866,11 +921,6 @@ class ClipboardViewModel: ObservableObject {
         if let shortcutData = UserDefaults.standard.data(forKey: "KeyboardShortcuts"),
            let savedShortcuts = try? JSONDecoder().decode([KeyboardShortcut].self, from: shortcutData) {
             keyboardShortcuts = savedShortcuts
-        }
-        
-        if let appSizeData = UserDefaults.standard.data(forKey: "AppSize"),
-           let savedAppSize = try? JSONDecoder().decode(AppSize.self, from: appSizeData) {
-            appSize = savedAppSize
         }
         
         if let themeData = UserDefaults.standard.data(forKey: "AppTheme"),
@@ -887,12 +937,11 @@ struct ClipboardAppView: View {
     @StateObject private var hotkeyManager = GlobalHotkeyManager.shared
     @StateObject private var menuBarManager = MenuBarManager()
     @State private var newShortcut: String = ""
-    @State private var selectedHotkey: String = "None"
+    @State private var selectedHotkey: String = "Command (⌘)"
     @State private var manualText: String = ""
     @State private var addToFavorites: Bool = false
     
     private let availableHotkeys = [
-        "None",
         "Command (⌘)",
         "Option (⌥)",
         "Control (⌃)",
@@ -923,15 +972,8 @@ struct ClipboardAppView: View {
             .onAppear {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
-                // Menu bar icon creation removed - no longer called
-                
-                if hotkeyManager.checkAccessibilityPermission() && !vm.keyboardShortcuts.isEmpty {
+                if AXIsProcessTrusted() && !vm.keyboardShortcuts.isEmpty {
                     vm.updateGlobalHotkeys()
-                }
-            }
-            .onChange(of: vm.appSize) { _ in
-                if let window = NSApp.windows.first {
-                    window.positionWindowAtMouse(size: vm.appSize)
                 }
             }
             
@@ -975,7 +1017,7 @@ struct ClipboardAppView: View {
                         .foregroundColor(.white)
                 }
                 
-                Text("CopyMac Clipboard")
+                Text("CopyMac")
                     .font(.headline)
             }
             
@@ -984,14 +1026,14 @@ struct ClipboardAppView: View {
             Button(action: { vm.showSettings.toggle() }) {
                 Image(systemName: "ellipsis")
                     .font(.title2)
-                    .padding(20)
+                    .padding(8)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Settings")
         }
         .padding(.horizontal, 4)
-        .padding(.vertical, 2)
+        .padding(.vertical, 1)
     }
     
     var contentList: some View {
@@ -1010,74 +1052,63 @@ struct ClipboardAppView: View {
                         .padding(.top, 60)
                     } else {
                         ForEach(Array(vm.filteredItems.enumerated()), id: \.1.id) { index, item in
-                            HStack(spacing: 8) {
-                                Text("\(index + 1).")
-                                    .font(.system(.body, design: .monospaced))
+                            HStack(spacing: 2) {
+                                Text(String(format: "%d.", index + 1))
+                                    .font(.system(size: 10, design: .monospaced))
                                     .foregroundColor(.gray)
-                                    .frame(width: 25, alignment: .trailing)
                                 
                                 if item.isImage {
                                     HStack {
+                                        Text("Image")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.primary)
+                                        
                                         if let imageData = item.imageData, let nsImage = NSImage(data: imageData) {
                                             Image(nsImage: nsImage)
                                                 .resizable()
                                                 .aspectRatio(contentMode: .fit)
-                                                .frame(width: 24, height: 18)
+                                                .frame(width: 20, height: 15)
                                                 .clipShape(RoundedRectangle(cornerRadius: 3))
                                         } else {
                                             Image(systemName: "photo")
                                                 .foregroundColor(.blue)
-                                                .frame(width: 24, height: 18)
+                                                .frame(width: 20, height: 15)
                                         }
-                                        Text("Image")
-                                            .font(.system(size: 13))
-                                            .foregroundColor(.secondary)
+                                        
                                         Spacer()
+                                        
+                                        if item.isFavorite {
+                                            Image(systemName: "star.fill")
+                                                .font(.system(size: 10))
+                                                .foregroundColor(.yellow)
+                                        }
                                     }
                                 } else {
-                                    HStack(spacing: 0) {
+                                    HStack {
                                         Text(item.content.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\t", with: " "))
-                                            .font(.system(size: 14))
+                                            .font(.system(size: 11))
                                             .lineLimit(1)
                                             .truncationMode(.tail)
                                             .frame(maxWidth: .infinity, alignment: .leading)
-                                            .layoutPriority(1)
                                         
-                                        HStack(spacing: 4) {
-                                            Button {
-                                                vm.toggleFavorite(item)
-                                            } label: {
-                                                Image(systemName: item.isFavorite ? "star.fill" : "star")
-                                                    .foregroundColor(item.isFavorite ? .yellow : .gray)
-                                                    .frame(width: 16, height: 16)
-                                            }
-                                            .buttonStyle(.plain)
-                                            .accessibilityLabel(item.isFavorite ? "Unfavorite" : "Favorite")
-                                            
-                                            Button {
-                                                vm.delete(item)
-                                            } label: {
-                                                Image(systemName: "trash")
-                                                    .foregroundColor(.gray)
-                                                    .frame(width: 16, height: 16)
-                                            }
-                                            .buttonStyle(.plain)
-                                            .accessibilityLabel("Delete")
+                                        if item.isFavorite {
+                                            Image(systemName: "star.fill")
+                                                .font(.system(size: 10))
+                                                .foregroundColor(.yellow)
                                         }
-                                        .frame(width: 44)
                                     }
                                 }
                             }
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                             .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .padding(.bottom, 8)
+                            .padding(.top, 0)
+                            .padding(.bottom, 24)
                             .background(
-                                vm.selectedItem?.id == item.id ? Color.blue.opacity(0.3) :
-                                vm.highlightedItem?.id == item.id ? Color.blue.opacity(0.15) :
+                                vm.selectedItem?.id == item.id ? Color.blue.opacity(0.5) :
+                                vm.highlightedItem?.id == item.id ? Color.blue.opacity(0.25) :
                                 index % 2 == 0 ?
-                                    (vm.theme == .dark ? Color(NSColor.controlBackgroundColor) : Color(NSColor.windowBackgroundColor)) :
-                                    (vm.theme == .dark ? Color(red: 0.15, green: 0.15, blue: 0.15) : Color(NSColor.controlBackgroundColor))
+                                    (vm.theme == .dark ? Color(red: 0.05, green: 0.05, blue: 0.05) : Color(red: 0.88, green: 0.88, blue: 0.88)) :
+                                    (vm.theme == .dark ? Color(red: 0.18, green: 0.18, blue: 0.18) : Color(red: 0.76, green: 0.76, blue: 0.76))
                             )
                             .cornerRadius(3)
                             .padding(.horizontal, 1)
@@ -1091,7 +1122,22 @@ struct ClipboardAppView: View {
                                 Button("Copy") {
                                     vm.copy(item)
                                 }
+                                
+                                Divider()
+                                
                                 if item.isFavorite {
+                                    Button("Move Up") {
+                                        vm.moveFavoriteUp(item)
+                                    }
+                                    .disabled(vm.items.filter { $0.isFavorite }.first?.id == item.id)
+                                    
+                                    Button("Move Down") {
+                                        vm.moveFavoriteDown(item)
+                                    }
+                                    .disabled(vm.items.filter { $0.isFavorite }.last?.id == item.id)
+                                    
+                                    Divider()
+                                    
                                     Button("Remove from Favorites") {
                                         vm.toggleFavorite(item)
                                     }
@@ -1100,6 +1146,9 @@ struct ClipboardAppView: View {
                                         vm.toggleFavorite(item)
                                     }
                                 }
+                                
+                                Divider()
+                                
                                 Button("Delete") {
                                     vm.delete(item)
                                 }
@@ -1107,15 +1156,14 @@ struct ClipboardAppView: View {
                         }
                     }
                 }
-                .padding(.top, 6)
             }
             
             HStack {
                 Image(systemName: "magnifyingglass")
                     .foregroundColor(.gray)
-                TextField("Search clipboard items", text: $vm.searchText)
+                TextField("Search Clipboard Items", text: $vm.searchText)
                     .textFieldStyle(.plain)
-                    .padding(.vertical, 6)
+                    .padding(.vertical, 4)
                     .padding(.horizontal, 8)
                     .background(Color(NSColor.controlBackgroundColor))
                     .cornerRadius(8)
@@ -1132,262 +1180,254 @@ struct ClipboardAppView: View {
                 }
             }
             .padding(.horizontal, 8)
-            .padding(.bottom, 8)
+            .padding(.bottom, 12)
             .padding(.top, 3)
         }
     }
     
     var settingsPanel: some View {
+        settingsContent
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(.windowBackgroundColor))
+            .cornerRadius(12)
+            .shadow(radius: 10)
+            .padding()
+            .focusable(false)
+            .allowsHitTesting(true)
+    }
+    
+    var settingsContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    Text("Settings").font(.headline)
-                    Spacer()
-                    Button {
-                        vm.showSettings = false
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.title3)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Close Settings")
-                }
-                
+                settingsHeader
                 Divider()
-                
-                // Manual Text Input Section
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Add Manual Entry")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    
-                    HStack(spacing: 8) {
-                        TextField("Enter text to add to clipboard history", text: $manualText)
-                            .textFieldStyle(.plain)
-                            .padding(.vertical, 8)
-                            .padding(.horizontal, 12)
-                            .background(Color(NSColor.controlBackgroundColor))
-                            .cornerRadius(8)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(manualText.isEmpty ? Color.clear : Color.blue, lineWidth: 2)
-                            )
-                        
-                        Button("Add") {
-                            if !manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                vm.insert(content: manualText, isFavorite: addToFavorites, showToast: true)
-                                let toastMessage = addToFavorites ? "Favorite Entry Added" : "Entry Added"
-                                vm.toast(toastMessage)
-                                manualText = ""
-                                addToFavorites = false
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }
-                    
-                    Toggle("Add to favorites", isOn: $addToFavorites)
-                        .font(.caption)
-                }
-                
+                manualEntrySection
                 Divider()
-                
-                // Theme Toggle Section
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Theme")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    
-                    ThemeToggle(theme: $vm.theme)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    
-                    Text("Choose between light and dark appearance")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                
+                themeSection
                 Divider()
-                
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("App Size")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    
-                    Picker("", selection: $vm.appSize) {
-                        Text("Small").tag(AppSize.small)
-                        Text("Large").tag(AppSize.large)
-                    }
-                    .pickerStyle(.segmented)
-                    
-                    let currentSize = vm.currentDimensions
-                    Text("Current: \(Int(currentSize.width))×\(Int(currentSize.height))")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                
+                shortcutsSection
                 Divider()
-                
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("Global Shortcuts")
-                            .font(.subheadline)
-                            .fontWeight(.medium)
-                        
-                        Spacer()
-                        
-                        HStack(spacing: 4) {
-                            Circle()
-                                .fill(hotkeyManager.isRegistered ? Color.green : Color.red)
-                                .frame(width: 6, height: 6)
-                            Text(hotkeyManager.isRegistered ? "Active" : "Inactive")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    
-                    ForEach(vm.keyboardShortcuts) { shortcut in
-                        HStack {
-                            Text(shortcut.combo)
-                                .font(.system(size: 13, design: .monospaced))
-                                .padding(6)
-                                .background(Color(NSColor.controlBackgroundColor))
-                                .cornerRadius(4)
-                            
-                            Spacer()
-                            
-                            Button {
-                                vm.removeShortcut(shortcut.combo)
-                            } label: {
-                                Image(systemName: "minus.circle.fill")
-                                    .foregroundColor(.red)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Add New Shortcut")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        
-                        HStack {
-                            TextField("e.g., ` or §", text: $newShortcut)
-                                .textFieldStyle(.plain)
-                                .padding(.vertical, 6)
-                                .padding(.horizontal, 8)
-                                .background(Color(NSColor.controlBackgroundColor))
-                                .cornerRadius(8)
-                            
-                            Picker("", selection: $selectedHotkey) {
-                                ForEach(availableHotkeys, id: \.self) { hotkey in
-                                    Text(hotkey).tag(hotkey)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            .frame(width: 150)
-                        }
-                        
-                        Button("Add") {
-                            if !newShortcut.isEmpty {
-                                vm.addShortcut(key: newShortcut, modifier: selectedHotkey)
-                                newShortcut = ""
-                                selectedHotkey = "None"
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(newShortcut.isEmpty)
-                    }
-                    .padding(.top, 8)
-                    
-                    if !hotkeyManager.isRegistered && !AXIsProcessTrusted() {
-                        HStack {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundColor(.orange)
-                                .font(.caption)
-                            
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Accessibility permission required")
-                                    .font(.caption)
-                                    .foregroundColor(.orange)
-                                
-                                Button("Open System Settings") {
-                                    hotkeyManager.openAccessibilitySettings()
-                                }
-                                .font(.caption)
-                                .buttonStyle(.bordered)
-                            }
-                        }
-                        .padding(8)
-                        .background(Color.orange.opacity(0.1))
-                        .cornerRadius(8)
-                    }
-                }
-                
+                importExportSection
                 Divider()
-                
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Import/Export")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    
-                    HStack(spacing: 12) {
-                        Button("Export History") {
-                            vm.exportHistory()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        
-                        Button("Import History") {
-                            vm.importHistory()
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                }
-                
-                Divider()
-                
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Clear History")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    
-                    Button("Clear") {
-                        vm.showClearConfirm = true
-                    }
-                    .foregroundColor(.red)
-                    
-                    if vm.showClearConfirm {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Clear all clipboard items (excluding favorites)?")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            HStack {
-                                Button("Cancel") {
-                                    vm.showClearConfirm = false
-                                }
-                                Button("Confirm") {
-                                    vm.clearNonFavorites()
-                                    vm.showClearConfirm = false
-                                }
-                                .foregroundColor(.red)
-                            }
-                        }
-                        .padding(8)
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .cornerRadius(6)
-                    }
-                }
-                
+                clearHistorySection
+                Text("Version v1.3.4")
+                    .font(.caption)
+                    .foregroundColor(.gray)
+                    .frame(maxWidth: .infinity, alignment: .center)
                 Spacer(minLength: 20)
             }
             .padding(16)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(.windowBackgroundColor))
-        .cornerRadius(12)
-        .shadow(radius: 10)
-        .padding()
-        .focusable(false)
-        .allowsHitTesting(true)
+    }
+    
+    var settingsHeader: some View {
+        HStack {
+            Text("Settings").font(.headline)
+            Spacer()
+            Button {
+                vm.showSettings = false
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title3)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close Settings")
+        }
+    }
+    
+    var manualEntrySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Add Manual Entry")
+                .font(.subheadline)
+                .fontWeight(.medium)
+            
+            HStack(spacing: 8) {
+                TextField("Enter text to add to clipboard history", text: $manualText)
+                    .textFieldStyle(.plain)
+                    .padding(.vertical, 8)
+                    .padding(.horizontal, 12)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(manualText.isEmpty ? Color.clear : Color.blue, lineWidth: 2)
+                    )
+                
+                Button("Add") {
+                    if !manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        vm.insert(content: manualText, isFavorite: addToFavorites, showToast: true)
+                        manualText = ""
+                        addToFavorites = false
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(manualText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            
+            Toggle("Add to favorites", isOn: $addToFavorites)
+                .font(.caption)
+        }
+    }
+    
+    var themeSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Theme")
+                .font(.subheadline)
+                .fontWeight(.medium)
+            
+            ThemeToggle(theme: $vm.theme)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            
+            Text("Choose between light and dark appearance")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+    
+    var shortcutsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Global Shortcuts")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                
+                Spacer()
+                
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(hotkeyManager.isRegistered ? Color.green : Color.red)
+                        .frame(width: 6, height: 6)
+                    Text(hotkeyManager.isRegistered ? "Active" : "Inactive")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            
+            existingShortcutsList
+            newShortcutForm
+            accessibilityWarning
+        }
+    }
+    
+    var existingShortcutsList: some View {
+        Group {
+            ForEach(vm.keyboardShortcuts) { shortcut in
+                HStack {
+                    Text(shortcut.combo)
+                        .font(.system(size: 13, design: .monospaced))
+                        .padding(6)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(4)
+                    
+                    Spacer()
+                    
+                    Button {
+                        vm.removeShortcut(shortcut.combo)
+                    } label: {
+                        Image(systemName: "minus.circle.fill")
+                            .foregroundColor(.red)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+    
+    var newShortcutForm: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Add New Shortcut")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            
+            HStack {
+                TextField("e.g., ` or §", text: $newShortcut)
+                    .textFieldStyle(.plain)
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 8)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(8)
+                
+                Picker("", selection: $selectedHotkey) {
+                    ForEach(availableHotkeys, id: \.self) { hotkey in
+                        Text(hotkey).tag(hotkey)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 150)
+            }
+            
+            Button("Add") {
+                if !newShortcut.isEmpty {
+                    vm.addShortcut(key: newShortcut, modifier: selectedHotkey)
+                    newShortcut = ""
+                    selectedHotkey = "Command (⌘)"
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(newShortcut.isEmpty)
+        }
+        .padding(.top, 8)
+    }
+    
+    var accessibilityWarning: some View {
+        Group {
+            // Remove accessibility warning since we don't need it for modifier-based hotkeys
+            EmptyView()
+        }
+    }
+    
+    var importExportSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Import/Export")
+                .font(.subheadline)
+                .fontWeight(.medium)
+            
+            HStack(spacing: 12) {
+                Button("Export History") {
+                    vm.exportHistory()
+                }
+                .buttonStyle(.borderedProminent)
+                
+                Button("Import History") {
+                    vm.importHistory()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+    }
+    
+    var clearHistorySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Clear History")
+                .font(.subheadline)
+                .fontWeight(.medium)
+            
+            Button("Clear") {
+                vm.showClearConfirm = true
+            }
+            .foregroundColor(.red)
+            
+            if vm.showClearConfirm {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Clear all clipboard items (excluding favorites)?")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    HStack {
+                        Button("Cancel") {
+                            vm.showClearConfirm = false
+                        }
+                        Button("Confirm") {
+                            vm.clearNonFavorites()
+                            vm.showClearConfirm = false
+                        }
+                        .foregroundColor(.red)
+                    }
+                }
+                .padding(8)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(6)
+            }
+        }
     }
     
     var previewPanel: some View {
@@ -1415,7 +1455,7 @@ struct ClipboardAppView: View {
                         Image(nsImage: nsImage)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
-                            .frame(maxWidth: vm.currentDimensions.width * 0.7, maxHeight: vm.currentDimensions.height * 0.25)
+                            .frame(maxWidth: vm.currentDimensions.width * 0.8, maxHeight: vm.currentDimensions.height * 0.4)
                             .border(Color.gray.opacity(0.3), width: 1)
                         
                         Text("Size: \(Int(nsImage.size.width)) × \(Int(nsImage.size.height))")
@@ -1429,9 +1469,14 @@ struct ClipboardAppView: View {
                                 .font(.subheadline)
                                 .fontWeight(.medium)
                             Spacer()
-                            Text("\(item.content.count) characters")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text("\(item.content.count) characters")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text("\(item.content.components(separatedBy: .newlines).count) lines")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
                         }
                         
                         ScrollView {
@@ -1442,7 +1487,7 @@ struct ClipboardAppView: View {
                                 .background(Color(NSColor.controlBackgroundColor))
                                 .cornerRadius(6)
                         }
-                        .frame(maxHeight: vm.currentDimensions.height * 0.25)
+                        .frame(maxHeight: vm.currentDimensions.height * 0.5)
                         
                         HStack {
                             Button("Copy") {
@@ -1461,15 +1506,13 @@ struct ClipboardAppView: View {
                     }
                 }
             }
-            
-            Spacer()
         }
-        .padding(12)
-        .frame(width: vm.currentDimensions.width * 0.85)
+        .padding(16)
+        .frame(width: vm.currentDimensions.width * 0.95, height: vm.currentDimensions.height * 0.85)
         .background(Color(.windowBackgroundColor))
         .cornerRadius(10)
         .shadow(radius: 8)
-        .padding()
+        .padding(8)
     }
 }
 
@@ -1484,9 +1527,9 @@ struct CopyMacApp: App {
         WindowGroup {
             ClipboardAppView()
                 .onAppear {
-                    // Menu bar icon creation removed - no longer called
+                    print("CopyMac app started")
                     if let window = NSApp.windows.first {
-                        window.positionWindowAtMouse(animated: false)
+                        window.positionWindowAtMouse(animated: true)
                     }
                 }
         }
