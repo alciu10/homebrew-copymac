@@ -1,6 +1,6 @@
 cask "copymac" do
-  version "1.6.9"
-  sha256 "eedb39bdb57a5d5fbf2bda58bbe7d023770c0f80415c568bc0b9af21cad3ff28"
+  version "1.7.0"
+  sha256 "f872ab81ee442bdc4977fb3f1ef8d9dce0f101ebadd3020559afd01f5e885cf2"
 
   url "https://github.com/alciu10/homebrew-copymac/releases/download/v#{version}/copymac-#{version}.zip"
   name "CopyMac"
